@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import anthropic
+from judges.base import JUDGE_MODEL, invoke_judge
 
-JUDGE_MODEL = "claude-opus-4-7"
+__all__ = ["JUDGE_MODEL", "judge_triage"]
 
 
 def _format_decision(decision: dict[str, Any]) -> str:
@@ -61,9 +61,16 @@ def _format_expected(expected: dict[str, Any]) -> str:
 async def judge_triage(
     scenario: dict[str, Any],
     decision: dict[str, Any],
-    client: anthropic.AsyncAnthropic | None = None,
+    provider: Any | None = None,
 ) -> dict[str, Any]:
-    cli = client or anthropic.AsyncAnthropic()
+    """Score one triage decision. ``provider`` is an
+    ``openexecutive.providers.LLMProvider``; when omitted we resolve one for
+    ``JUDGE_MODEL`` so the judge honours the same routing as production
+    instead of opening its own Anthropic connection."""
+    if provider is None:
+        from openexecutive.providers import get_provider
+
+        provider = get_provider(JUDGE_MODEL)
 
     judge_prompt = f"""You are an evaluator for a Triage agent that decides whether incoming
 events (emails, Slack messages, documents) should fire proactive alerts to a
@@ -97,16 +104,8 @@ Respond in JSON:
 {{"severity_accuracy": N, "channel_appropriateness": N, "dedup_correctness": N, "overall": N, "notes": "brief explanation"}}
 """
 
-    message = await cli.messages.create(
-        model=JUDGE_MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": judge_prompt}],
-    )
-
-    text = message.content[0].text  # type: ignore[union-attr]
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except Exception:
-        return {"overall": 0, "notes": "Failed to parse triage judge response"}
+    # Routed through the shared contract: a parse failure raises JudgeError
+    # instead of returning {"overall": 0}. The old fail-open turned a judge
+    # outage into a fabricated product failure that a run could still report
+    # as COMPLETE.
+    return await invoke_judge(provider, judge_prompt)

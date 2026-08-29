@@ -26,6 +26,18 @@ def _scenarios_dir() -> Path:
     return Path(__file__).parent / "_scenarios"
 
 
+def scenarios_dir() -> Path:
+    """Public read-only accessor for the resolved built-in scenario directory.
+
+    Callers that must *report* where scenarios came from (the CLI runner prints
+    it as run evidence, and fails when it does not exist) need the same path
+    this module loads from. Exposing it keeps directory resolution in exactly
+    one place — a second implementation is how the CLI came to point at a
+    directory that had not existed for some time.
+    """
+    return _scenarios_dir()
+
+
 def scenario_kind(s: dict[str, Any]) -> str:
     if s.get("domain") == "triage":
         return "triage"

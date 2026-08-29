@@ -33,9 +33,14 @@ chroma_db/
 packages/core/openexecutive/knowledge/external/
 
 # Environment
+# Ignore every .env variant, not just the known suffixes: editor/shell backups
+# (.env.save, .env.bak, .env~) and ad-hoc copies (.env.prod, .env.old) carry
+# the same live credentials as .env itself, and an enumerated list silently
+# misses them — one `git add -A` then publishes real keys.
 .env
-.env.local
-.env.*.local
+.env.*
+# ...except the committed template, which holds placeholders only.
+!.env.example
 
 # Local Google Workspace OAuth credential minted by scripts/mint-google-token.py
 # (the live refresh token — never commit)

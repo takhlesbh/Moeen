@@ -287,6 +287,11 @@ async def start_eval_run(request: Request) -> StreamingResponse:
                 }
             )
 
+            # Infrastructure failures (judge unusable, agent crash) must not
+            # be reportable as a COMPLETED run — the whole point of E1 is that
+            # a harness fault never masquerades as a product result.
+            scenario_errors: list[dict[str, Any]] = []
+
             async for event in run_scenarios(
                 kind=kind,
                 scenario_id=scenario_id,
@@ -303,6 +308,7 @@ async def start_eval_run(request: Request) -> StreamingResponse:
                     )
                     yield _sse(event | {"run_id": run_id})
                 elif etype == "scenario_error":
+                    scenario_errors.append(event)
                     append_scenario_result(
                         run_id=run_id,
                         result=event,
@@ -312,6 +318,34 @@ async def start_eval_run(request: Request) -> StreamingResponse:
                 elif etype == "scenario_start":
                     yield _sse(event | {"run_id": run_id})
                 elif etype == "suite_done":
+                    if scenario_errors:
+                        # Persist as FAILED, not completed, and say why. The
+                        # client sees an explicit failure state rather than a
+                        # pass count silently computed over fewer verdicts
+                        # than there were scenarios.
+                        summary = "; ".join(
+                            f"{e.get('scenario_id')}: "
+                            f"{e.get('error_kind', 'error')}"
+                            for e in scenario_errors
+                        )
+                        fail_eval_run(
+                            run_id=run_id,
+                            error=f"{len(scenario_errors)} scenario error(s) — {summary}",
+                        )
+                        yield _sse(
+                            {
+                                "type": "error",
+                                "run_id": run_id,
+                                "message": (
+                                    f"run incomplete: {len(scenario_errors)} "
+                                    f"scenario error(s) — {summary}"
+                                ),
+                                "errors": scenario_errors,
+                                "passed": event.get("passed", 0),
+                                "total": event.get("total", 0),
+                            }
+                        )
+                        return
                     complete_eval_run(run_id)
                     yield _sse(
                         {

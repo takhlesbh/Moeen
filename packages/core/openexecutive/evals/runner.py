@@ -26,6 +26,7 @@ import os
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from typing import Any
 
+from openexecutive.evals.judge_contract import JudgeError
 from openexecutive.evals.judges import judge_chat, judge_triage, judge_workflow
 from openexecutive.evals.scenarios import load_scenarios
 
@@ -198,6 +199,26 @@ def _make_triage_runner(
                             "decision": decision_dict,
                         }
                     )
+                except JudgeError as exc:
+                    # A judge that could not be parsed is an infrastructure
+                    # failure, not a score. Emitting scenario_error (rather than
+                    # a scenario_done carrying overall=0) is what keeps a broken
+                    # judge from masquerading as a product regression.
+                    logger.error(
+                        "eval scenario %s: judge unusable: %s", scenario["id"], exc
+                    )
+                    await queue.put(
+                        {
+                            "type": "scenario_error",
+                            "index": i,
+                            "total": total,
+                            "scenario_id": scenario["id"],
+                            "error_kind": "judge_unparseable",
+                            "error": str(exc),
+                            "judge_raw": exc.raw,
+                        }
+                    )
+
                 except Exception as exc:
                     logger.exception("eval scenario %s failed", scenario["id"])
                     await queue.put(
@@ -273,6 +294,26 @@ def _make_workflow_runner(
                             "artifact": artifact,
                         }
                     )
+                except JudgeError as exc:
+                    # A judge that could not be parsed is an infrastructure
+                    # failure, not a score. Emitting scenario_error (rather than
+                    # a scenario_done carrying overall=0) is what keeps a broken
+                    # judge from masquerading as a product regression.
+                    logger.error(
+                        "eval scenario %s: judge unusable: %s", scenario["id"], exc
+                    )
+                    await queue.put(
+                        {
+                            "type": "scenario_error",
+                            "index": i,
+                            "total": total,
+                            "scenario_id": scenario["id"],
+                            "error_kind": "judge_unparseable",
+                            "error": str(exc),
+                            "judge_raw": exc.raw,
+                        }
+                    )
+
                 except Exception as exc:
                     logger.exception("eval scenario %s failed", scenario["id"])
                     await queue.put(
@@ -356,6 +397,26 @@ def _make_chat_runner(
                             "response": response,
                         }
                     )
+                except JudgeError as exc:
+                    # A judge that could not be parsed is an infrastructure
+                    # failure, not a score. Emitting scenario_error (rather than
+                    # a scenario_done carrying overall=0) is what keeps a broken
+                    # judge from masquerading as a product regression.
+                    logger.error(
+                        "eval scenario %s: judge unusable: %s", scenario["id"], exc
+                    )
+                    await queue.put(
+                        {
+                            "type": "scenario_error",
+                            "index": i,
+                            "total": total,
+                            "scenario_id": scenario["id"],
+                            "error_kind": "judge_unparseable",
+                            "error": str(exc),
+                            "judge_raw": exc.raw,
+                        }
+                    )
+
                 except Exception as exc:
                     logger.exception("eval scenario %s failed", scenario["id"])
                     await queue.put(

@@ -155,6 +155,67 @@ class Settings(BaseSettings):
     # hosted API. Default generous so a slow first token doesn't time out.
     local_timeout_s: float = Field(300.0, alias="LOCAL_TIMEOUT_S")
 
+    # ---- Local backend request defaults ---------------------------------
+    # Applied by OpenAICompatibleProvider ONLY where a caller passed nothing,
+    # so a self-hosted model's sampling/reasoning profile lives with the
+    # backend instead of being hardcoded at every call site. All default to
+    # None = "send nothing", which keeps a fresh checkout byte-identical to
+    # before; the operator opts in per deployment. See .env.example for the
+    # values a given local model wants.
+    #
+    # These reach the wire only for models routed to the LOCAL backend —
+    # OpenRouter and Anthropic-direct never see them.
+    local_temperature: float | None = Field(None, alias="LOCAL_TEMPERATURE")
+    # Probability mass, so it is bounded by definition — a value outside [0, 1]
+    # is not a tuning choice, it is a typo, and catching it here fails at boot
+    # instead of on every request. Deliberately NOT bounding temperature or
+    # presence_penalty: their useful ranges differ per backend and this app does
+    # not model backend-specific limits.
+    local_top_p: float | None = Field(None, alias="LOCAL_TOP_P", ge=0.0, le=1.0)
+    local_presence_penalty: float | None = Field(None, alias="LOCAL_PRESENCE_PENALTY")
+    # OpenAI-format reasoning control, forwarded verbatim. "none" disables a
+    # thinking model's reasoning pass. Only sent when set, and only to a
+    # backend whose FeatureSpec declares supports_reasoning_effort — otherwise
+    # the feature gate strips it and the provider logs the removal.
+    local_reasoning_effort: str | None = Field(None, alias="LOCAL_REASONING_EFFORT")
+
+    @field_validator(
+        "local_temperature",
+        "local_top_p",
+        "local_presence_penalty",
+        "local_reasoning_effort",
+        mode="before",
+    )
+    @classmethod
+    def _blank_local_default_is_unset(cls, v: Any) -> Any:
+        """Treat a blank or comment-only value as "operator did not configure this".
+
+        ``.env.example`` ships these keys present-but-empty, which is this
+        file's convention for an optional setting, and a blank env var / Fly
+        secret / compose entry is the natural way to say "leave it off". For
+        the ``float`` fields pydantic would otherwise reject ``""`` outright
+        and the app would not boot at all — so the documented
+        ``cp .env.example .env`` first run would fail.
+
+        For ``local_reasoning_effort`` the failure was quieter and worse: a
+        blank string is not None, so it survived every ``is not None`` guard on
+        the path and shipped ``reasoning_effort: ""`` — an out-of-enum value —
+        on every local request.
+
+        Shares ``_blank_or_comment`` with the Discord validators rather than
+        re-deciding what "blank" means: that also covers a dotenv inline
+        ``# comment`` captured as the value, which this validator previously
+        passed through to a float parse error. ``env_ignore_empty=True`` on
+        ``model_config`` already drops empty values arriving from env/dotenv,
+        but not values passed directly to ``Settings(...)``, and it does not
+        trim surrounding whitespace — both of which this still handles.
+        """
+        if _blank_or_comment(v):
+            return None
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
     @field_validator("local_models", mode="before")
     @classmethod
     def _parse_local_models(cls, v: Any) -> list[str]:
