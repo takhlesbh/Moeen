@@ -9,8 +9,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import anthropic
-
+# Single source of truth for the judge model. Defined here (the leaf module)
+# and imported by run_evals, so the model a provider is resolved FOR can never
+# drift from the model the request is labelled WITH — a mismatch would route
+# by one slug and send another, and the OpenAI-compatible path passes unknown
+# slugs upstream unchanged.
 JUDGE_MODEL = "claude-opus-4-7"
 
 
@@ -61,9 +64,16 @@ def _format_expected(expected: dict[str, Any]) -> str:
 async def judge_triage(
     scenario: dict[str, Any],
     decision: dict[str, Any],
-    client: anthropic.AsyncAnthropic | None = None,
+    provider: Any | None = None,
 ) -> dict[str, Any]:
-    cli = client or anthropic.AsyncAnthropic()
+    """Score one triage decision. ``provider`` is an
+    ``openexecutive.providers.LLMProvider``; when omitted we resolve one for
+    ``JUDGE_MODEL`` so the judge honours the same routing as production
+    instead of opening its own Anthropic connection."""
+    if provider is None:
+        from openexecutive.providers import get_provider
+
+        provider = get_provider(JUDGE_MODEL)
 
     judge_prompt = f"""You are an evaluator for a Triage agent that decides whether incoming
 events (emails, Slack messages, documents) should fire proactive alerts to a
@@ -97,7 +107,7 @@ Respond in JSON:
 {{"severity_accuracy": N, "channel_appropriateness": N, "dedup_correctness": N, "overall": N, "notes": "brief explanation"}}
 """
 
-    message = await cli.messages.create(
+    message = await provider.messages_create(
         model=JUDGE_MODEL,
         max_tokens=500,
         messages=[{"role": "user", "content": judge_prompt}],

@@ -18,6 +18,15 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "packages" / "core"))
 
+# Judge model, imported (not redeclared) from the judges package so the model
+# a provider is resolved FOR always matches the model requests are labelled
+# WITH. Routed through ``openexecutive.providers.get_provider`` like every
+# production call site, so an operator running the suite against OpenRouter or
+# a local backend does not have the judge silently pinned to a direct
+# Anthropic connection.
+sys.path.insert(0, str(Path(__file__).parent))
+from judges.triage_judge import JUDGE_MODEL  # noqa: E402
+
 
 async def run_eval(scenario: dict, executive, session_factory) -> dict:
     from openexecutive.memory.company_profile import CompanyProfile
@@ -53,7 +62,7 @@ async def run_eval(scenario: dict, executive, session_factory) -> dict:
     }
 
 
-async def judge_response(scenario: dict, response: str, client) -> dict:
+async def judge_response(scenario: dict, response: str, provider) -> dict:
     judge_prompt = f"""You are an evaluator for an AI executive advisory system.
 
 Evaluate this response to an executive question on a 1-5 scale for each dimension.
@@ -74,8 +83,8 @@ Rate each dimension (1=poor, 3=acceptable, 5=excellent):
 Respond in JSON format:
 {{"persona_coherence": N, "domain_accuracy": N, "actionability": N, "topic_coverage": N, "specificity": N, "overall": N, "notes": "brief explanation"}}"""
 
-    message = await client.messages.create(
-        model="claude-opus-4-7",
+    message = await provider.messages_create(
+        model=JUDGE_MODEL,
         max_tokens=500,
         messages=[{"role": "user", "content": judge_prompt}],
     )
@@ -122,7 +131,7 @@ async def run_workflow_eval(scenario: dict, store) -> dict:
     }
 
 
-async def judge_workflow(scenario: dict, artifact: str, client) -> dict:
+async def judge_workflow(scenario: dict, artifact: str, provider) -> dict:
     expected_sections = scenario.get("expected_artifact_sections", []) or []
     quality_criteria = scenario.get("quality_criteria", {}) or {}
 
@@ -150,8 +159,8 @@ Rate each dimension 1-5 (1=poor, 3=acceptable, 5=excellent):
 Respond in JSON:
 {{"structure": N, "specificity": N, "actionability": N, "coherence": N, "completeness": N, "overall": N, "notes": "brief"}}"""
 
-    message = await client.messages.create(
-        model="claude-opus-4-7",
+    message = await provider.messages_create(
+        model=JUDGE_MODEL,
         max_tokens=500,
         messages=[{"role": "user", "content": judge_prompt}],
     )
@@ -165,8 +174,13 @@ Respond in JSON:
         return {"overall": 0, "notes": "Failed to parse judge response"}
 
 
-async def run_triage_eval(scenario: dict, client) -> dict:
+async def run_triage_eval(scenario: dict) -> dict:
     """Runs a triage scenario directly against the TriageAgent (no Executive loop).
+
+    Takes no client/provider: ``TriageAgent.triage`` resolves its own backend
+    via ``get_provider`` when none is injected, so the judge's provider must
+    not be threaded in here (the agent and the judge can legitimately run on
+    different models).
 
     Scenario YAML must include `event` + `context` (with `recent_alerts`,
     `muted_topics`, `active_initiatives`).
@@ -246,9 +260,9 @@ async def main() -> None:
     initialize_overrides_db()
     ReviewStore.initialize_db()
 
-    import anthropic
+    from openexecutive.providers import get_provider
 
-    client = anthropic.AsyncAnthropic()
+    judge_provider = get_provider(JUDGE_MODEL)
 
     scenario_dir = Path(args.scenarios)
     output_dir = Path(args.output)
@@ -292,8 +306,8 @@ async def main() -> None:
         for scenario in scenarios:
             print(f"  [{scenario['id']}] {scenario['description']}")
             try:
-                result = await run_triage_eval(scenario, client)
-                scores = await judge_triage(scenario, result["decision"], client)
+                result = await run_triage_eval(scenario)
+                scores = await judge_triage(scenario, result["decision"], judge_provider)
                 result["scores"] = scores
                 result["passed"] = scores.get("overall", 0) >= 3.5
                 results.append(result)
@@ -311,7 +325,7 @@ async def main() -> None:
             print(f"  [{scenario['id']}] {scenario['description']}")
             try:
                 result = await run_workflow_eval(scenario, store)
-                scores = await judge_workflow(scenario, result["artifact"], client)
+                scores = await judge_workflow(scenario, result["artifact"], judge_provider)
                 result["scores"] = scores
                 result["passed"] = scores.get("overall", 0) >= 3.5
                 results.append(result)
@@ -329,7 +343,7 @@ async def main() -> None:
             print(f"  [{scenario['id']}] {scenario['description']}")
             try:
                 result = await run_eval(scenario, executive, None)
-                scores = await judge_response(scenario, result["response"], client)
+                scores = await judge_response(scenario, result["response"], judge_provider)
                 result["scores"] = scores
                 result["passed"] = scores.get("overall", 0) >= 3.5
                 results.append(result)

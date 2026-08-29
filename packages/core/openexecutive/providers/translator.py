@@ -19,9 +19,15 @@ What we DO NOT translate:
   For non-Anthropic slugs the feature_gate has already stripped them
   before we get here, so the no-cache_control path falls back to the
   legacy string-flatten form for maximum upstream compatibility.
-* Anthropic thinking / output_config blocks — feature_gate has either
-  preserved them (Claude family) or popped them (non-Claude); we just
-  forward whatever is left.
+* Anthropic thinking / output_config — NOT representable here. There is
+  no OpenAI ``/chat/completions`` field this codebase can prove carries
+  Anthropic's adaptive thinking or ``output_config.effort``, so we emit
+  none. Every OpenAI-compatible FeatureSpec therefore sets
+  ``supports_thinking=False`` and the gate removes both fields before we
+  run (the provider logs the removal). If one still reaches us the gate
+  was bypassed, and ``to_openai_request`` raises
+  ``UnsupportedFeatureError`` rather than shipping a request that
+  silently lacks the capability the caller asked for.
 * Web-search server tools — feature_gate stripped these for non-Claude
   models before we ran. For Claude family (where feature_gate keeps them)
   the Anthropic ``web_search_*`` server tool can't be executed by
@@ -36,9 +42,29 @@ What we DO NOT translate:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from types import SimpleNamespace
 from typing import Any
+
+from openexecutive.providers.feature_gate import UnsupportedFeatureError
+
+logger = logging.getLogger(__name__)
+
+# Anthropic request fields this translator has no proven OpenAI-format
+# representation for. The feature gate strips them before we run (every
+# OpenAI-compatible spec sets ``supports_thinking=False``); reaching the
+# translator with one still attached means the gate was bypassed, and we
+# refuse rather than emit a body that silently lacks the capability.
+_UNREPRESENTABLE_REQUEST_FIELDS = ("thinking", "output_config")
+
+# Reasoning/thinking text some OpenAI-compatible backends return alongside
+# ``content``. We deliberately do NOT synthesize an Anthropic ``thinking``
+# block from it: we never asked for reasoning (the gate strips the request
+# field), the wire formats differ per backend, and fabricating a block would
+# make ordinary prose look like verified model reasoning. We log that it was
+# present and dropped so the loss is visible.
+_REASONING_RESPONSE_FIELDS = ("reasoning", "reasoning_content")
 
 
 def _any_block_has_cache_control(blocks: Any) -> bool:
@@ -320,7 +346,20 @@ def _web_search_plugin(tools: Any) -> dict[str, Any] | None:
 
 def to_openai_request(model_slug: str, anthropic_kwargs: dict[str, Any]) -> dict[str, Any]:
     """Translate an Anthropic ``messages.create`` kwargs dict to an OpenAI
-    ``/chat/completions`` body. ``model_slug`` is the OpenRouter model id."""
+    ``/chat/completions`` body. ``model_slug`` is the OpenRouter model id.
+
+    Raises ``UnsupportedFeatureError`` if the kwargs still carry a field this
+    format cannot represent (``thinking`` / ``output_config``). The feature
+    gate strips those upstream, so this is an invariant guard: it converts a
+    silent capability loss into a loud, attributable failure."""
+    unrepresentable = [
+        f
+        for f in _UNREPRESENTABLE_REQUEST_FIELDS
+        if anthropic_kwargs.get(f) is not None
+    ]
+    if unrepresentable:
+        raise UnsupportedFeatureError(model_slug, unrepresentable)
+
     body: dict[str, Any] = {
         "model": model_slug,
         "messages": [],
@@ -487,11 +526,46 @@ def _stream_strip_cite(buf: str) -> tuple[str, str]:
     return cleaned, ""
 
 
+def reasoning_text(container: Any) -> str:
+    """Reasoning/thinking text carried by an OpenAI-format message or delta.
+
+    Backends disagree on the field name (``reasoning`` on OpenRouter,
+    ``reasoning_content`` on several vLLM/DeepSeek-style servers), so we
+    accept both and return "" when neither is present or non-string.
+    """
+    if not isinstance(container, dict):
+        return ""
+    for field in _REASONING_RESPONSE_FIELDS:
+        value = container.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _note_dropped_reasoning(chars: int, *, streaming: bool) -> None:
+    """Surface reasoning content we received but cannot represent.
+
+    Deliberately NOT turned into an Anthropic ``thinking`` block: reasoning
+    was never requested (the gate strips the request field), so a fabricated
+    block would present ordinary model prose as verified reasoning. Callers
+    that consume ``content`` are unaffected — this only makes the drop
+    visible."""
+    if chars <= 0:
+        return
+    logger.warning(
+        "OpenAI-compatible %s carried %d chars of reasoning content; dropped "
+        "(no Anthropic thinking-block representation is claimed for it)",
+        "stream" if streaming else "response",
+        chars,
+    )
+
+
 def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
     """OpenAI ``/chat/completions`` non-streaming response →
     Anthropic-shape ``Message`` (duck-typed)."""
     choice = (body.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
+    _note_dropped_reasoning(len(reasoning_text(msg)), streaming=False)
     content_blocks: list[SimpleNamespace] = []
 
     text = msg.get("content")
@@ -598,6 +672,9 @@ class StreamAccumulator:
         self._usage: dict[str, Any] = {}
         self._model: str = ""
         self._id: str = ""
+        # Reasoning deltas some backends interleave with content. Counted so
+        # finalize() can report the drop; never emitted as a thinking block.
+        self._reasoning_chars = 0
 
     def feed(self, chunk: dict[str, Any]) -> list[SimpleNamespace]:
         """Process one OpenAI SSE chunk. Returns 0+ Anthropic-shape events to
@@ -618,6 +695,8 @@ class StreamAccumulator:
             return events
         choice = choices[0]
         delta = choice.get("delta") or {}
+
+        self._reasoning_chars += len(reasoning_text(delta))
 
         text = delta.get("content")
         if isinstance(text, str) and text:
@@ -684,6 +763,7 @@ class StreamAccumulator:
         Called by the OpenRouterProvider stream wrapper when SSE closes,
         before the consumer awaits ``stream.get_final_message()``.
         """
+        _note_dropped_reasoning(self._reasoning_chars, streaming=True)
         content_blocks: list[SimpleNamespace] = []
         if self._text_started:
             content_blocks.append(

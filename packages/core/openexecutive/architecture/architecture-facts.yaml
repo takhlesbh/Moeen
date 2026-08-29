@@ -55,6 +55,15 @@ system:
       Provider selection is per-call by model, not global — so the
       Executive can be on GPT-5 while the CFO specialist stays on
       claude-opus-4-7 within the same turn.
+      Adaptive thinking + output_config.effort are unsupported on EVERY
+      OpenAI-compatible route, Claude-via-OpenRouter included: the OpenAI
+      /chat/completions body has no proven representation for them, so
+      OpenAICompatibleProvider forces supports_thinking=False on every spec
+      it is given and the gate removes both fields (logging the removal).
+      cache_control and web_search DO survive that route — as Anthropic
+      cache hints OpenRouter forwards upstream, and as OpenRouter's `web`
+      plugin. Anthropic-direct routing never runs the gate and is
+      unaffected, so deep-reasoning specialists keep full thinking there.
   invariants:
     - The internal sub-agent architecture is NEVER exposed to the end user — there is one voice (the Executive).
     - The Executive never signs messages under the name of company personnel or impersonates them. An identity addendum in system block 0 instructs the model to use its own exec name/email only.
@@ -67,7 +76,24 @@ system:
     - Company-specific data lives under packages/core/company/ and is gitignored. Never commit it.
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
-    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config, server-side web_search) are stripped by the feature gate before the request leaves the process. Callers do NOT need to know which model they're routing to.
+    - When a model is routed over an OpenAI-compatible backend, Anthropic-only fields it cannot represent (cache_control on system/tool/user blocks, adaptive thinking + output_config, server-side web_search) are stripped by the feature gate before the request leaves the process. Callers do NOT need to know which model they're routing to — but a stripped capability is never silent: the provider logs each removed capability with the resolved slug (`providers.feature_gate.unsupported_requested`), and `to_openai_request` raises `UnsupportedFeatureError` if an unrepresentable field ever reaches translation with the gate bypassed. A capability is either translated, or explicitly surfaced as unsupported — never requested-then-discarded.
+    - A reasoning/thinking field returned by an OpenAI-compatible backend is logged and dropped, never converted into an Anthropic `thinking` content block. Reasoning is not requested on that path (the gate strips the request field), so fabricating a block would present ordinary model prose as verified reasoning.
+    - >-
+      OpenAI-compatible provider retries are bounded at the Anthropic SDK's
+      default depth (2 retries / 3 attempts) but are deliberately NARROWER
+      than that SDK, because we send no Idempotency-Key. Only 408/409/429/5xx
+      and connect-class transport failures (ConnectError, ConnectTimeout,
+      PoolTimeout) are retried — cases where the request provably never
+      reached the model. Read-side failures (ReadTimeout, ReadError,
+      RemoteProtocolError) are NOT retried, because the request landed and
+      the completion is already being generated and billed, so a retry would
+      pay up to 3x for one logical call. Other 4xx are caller errors and
+      propagate on the first attempt. Backoff is capped exponential with full
+      jitter (a parallel specialist fan-out must not retry in lockstep) and
+      honours a server's Retry-After when present. A stream is retried only
+      before its first event is yielded — a half-delivered reply is never
+      replayed, and every failure path closes its httpx response context
+      before the next attempt so retries cannot orphan pooled connections.
     - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.

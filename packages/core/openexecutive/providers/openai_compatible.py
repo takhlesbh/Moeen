@@ -27,17 +27,25 @@ Streaming notes:
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable
+import math
+import random
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 
-from openexecutive.providers.feature_gate import FeatureSpec, apply_feature_gates
+from openexecutive.providers.feature_gate import (
+    FeatureSpec,
+    apply_feature_gates,
+    unsupported_requested,
+)
 from openexecutive.providers.translator import (
     StreamAccumulator,
     from_openai_response,
@@ -45,6 +53,182 @@ from openexecutive.providers.translator import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# Bounded retries, matching the ``anthropic.AsyncAnthropic`` default of
+# ``DEFAULT_MAX_RETRIES = 2`` (3 attempts total) so reliability stops
+# depending on which backend a model happens to route to.
+#
+# This is deliberately NOT full parity with that SDK: it sends no
+# Idempotency-Key, so we cannot let a retry double-charge for work the
+# backend already did. ``/chat/completions`` is billable and generation
+# starts as soon as the request lands, which drives the retry policy below.
+_DEFAULT_MAX_RETRIES = 2
+_DEFAULT_RETRY_BACKOFF_S = 0.5
+# Cap a single backoff sleep. With 300s local timeouts, an unbounded
+# exponential would let one call sit far past any upstream proxy deadline.
+_MAX_RETRY_BACKOFF_S = 8.0
+# Honour a server's own pacing, but never park a coroutine indefinitely
+# because a backend sent an outlandish Retry-After.
+_MAX_RETRY_AFTER_S = 30.0
+# Chars of a backend error body to log. Bodies can echo request fragments,
+# so we log one truncated copy on the final failure only.
+_ERROR_BODY_LOG_CHARS = 500
+
+# Server rejected the request without generating: safe and free to retry.
+_RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+# Transport failures where the request provably never reached the model, so a
+# retry cannot double-bill. Read-side failures (ReadTimeout, ReadError,
+# RemoteProtocolError) are deliberately EXCLUDED: the request landed and the
+# completion is already being generated and charged, so retrying would pay
+# for the same call up to three times and multiply a slow generation's
+# latency by three. Those propagate on the first attempt instead.
+_RETRYABLE_TRANSPORT = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """True only for failures that are both transient AND provably unbilled."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    return isinstance(exc, _RETRYABLE_TRANSPORT)
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """The server's requested delay from a ``Retry-After`` header, if any.
+
+    Only the delta-seconds form is honoured; the HTTP-date form is rare on
+    these APIs and parsing it would add clock-skew failure modes for no real
+    benefit. Clamped so a hostile or buggy value cannot hang the caller.
+
+    The header is backend-controlled, so non-finite values are rejected
+    explicitly: ``float("nan")`` passes a bare ``< 0`` test (every NaN
+    comparison is False) and ``min(nan, cap)`` returns NaN, which would reach
+    ``asyncio.sleep`` — collapsing the backoff to ~0 on Python 3.11/3.12 and
+    raising an uncaught ValueError on 3.13+. Either way one header would
+    defeat the rate-limit backoff entirely.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    raw = exc.response.headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return min(seconds, _MAX_RETRY_AFTER_S)
+
+
+def _retry_delay(attempt: int, exc: BaseException, base_backoff_s: float) -> float:
+    """Seconds to wait before ``attempt`` (1-based), for one failure.
+
+    Prefers the server's own ``Retry-After`` over our guess — retrying faster
+    than a rate limiter asked only deepens the rate limit. Otherwise capped
+    exponential backoff with jitter: the orchestrator fans specialists out in
+    parallel, so without jitter every one of them would retry in lockstep and
+    re-create the burst that caused the 429.
+    """
+    requested = _retry_after_seconds(exc)
+    if requested is not None:
+        # Jitter the server's value too. A parallel specialist fan-out that
+        # all get "429, Retry-After: 5" would otherwise wake at the identical
+        # instant — the exact thundering herd jitter exists to break. Stay in
+        # [0.5x, 1.0x] so we never retry sooner than half what was asked.
+        return random.uniform(requested * 0.5, requested)
+    capped = min(base_backoff_s * (2 ** (attempt - 1)), _MAX_RETRY_BACKOFF_S)
+    # Full jitter over [0, capped]; spreads a synchronized fan-out.
+    return random.uniform(0, capped)
+
+
+def _without_thinking(spec: FeatureSpec) -> FeatureSpec:
+    """``spec`` with ``supports_thinking`` forced off (no-op if already off)."""
+    if not spec.supports_thinking:
+        return spec
+    return replace(spec, supports_thinking=False)
+
+
+def _describe(exc: BaseException) -> str:
+    """Short, body-free description of a failure for intermediate retry logs."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    return type(exc).__name__
+
+
+def _sanitize_for_log(text: str) -> str:
+    """Collapse control characters in backend-controlled text.
+
+    An error body is written by the backend, so newlines in it would let a
+    hostile or compromised endpoint forge additional log lines (log
+    injection / audit forgery). Replacing every control char keeps the body
+    on exactly one line.
+    """
+    return "".join(" " if ch < " " or ch == "\x7f" else ch for ch in text)
+
+
+def _log_terminal_failure(label: str, exc: BaseException) -> None:
+    """The single detailed record of a failure we are done retrying.
+
+    Intermediate attempts stay terse: an error body can echo request
+    fragments, so it is logged once at the end rather than once per attempt
+    (and never at all when a later attempt succeeds).
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        logger.error(
+            "%s returned %s: %s",
+            label,
+            exc.response.status_code,
+            _sanitize_for_log(exc.response.text[:_ERROR_BODY_LOG_CHARS]),
+        )
+    else:
+        # Transport failures carry no body — log the cause so a non-retried
+        # (or retry-exhausted) failure is never silent.
+        logger.error("%s transport failure: %s", label, _describe(exc))
+
+
+async def _with_retry(
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    label: str,
+    max_retries: int,
+    backoff_s: float,
+    on_retry: Callable[[], Awaitable[None]] | None = None,
+) -> _T:
+    """Run ``operation`` with bounded retries on transient, unbilled failures.
+
+    Module-level so the non-streaming POST and the stream open share ONE
+    retry driver — the bound, the backoff policy and the logging cannot drift
+    apart between them. ``on_retry`` releases or resets whatever the failed
+    attempt left behind before the next try.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await operation()
+        except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+            if not _is_retryable(exc) or attempt >= max_retries:
+                _log_terminal_failure(label, exc)
+                raise
+            attempt += 1
+            delay = _retry_delay(attempt, exc, backoff_s)
+            logger.warning(
+                "%s failed (%s); retry %d of %d in %.2fs",
+                label,
+                _describe(exc),
+                attempt,
+                max_retries,
+                delay,
+            )
+            if on_retry is not None:
+                await on_retry()
+            await asyncio.sleep(delay)
 
 
 class OpenAICompatibleProvider:
@@ -63,6 +247,8 @@ class OpenAICompatibleProvider:
         timeout_s: float = 180.0,
         slug_lookup: dict[str, str] | None = None,
         spec_lookup: dict[str, FeatureSpec] | None = None,
+        max_retries: int = _DEFAULT_MAX_RETRIES,
+        retry_backoff_s: float = _DEFAULT_RETRY_BACKOFF_S,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -71,11 +257,23 @@ class OpenAICompatibleProvider:
             headers=default_headers or {},
             timeout=timeout_s,
         )
+        # Bounded: never negative, so a misconfigured 0 means "one attempt,
+        # no retries" rather than an unbounded loop.
+        self._max_retries = max(0, max_retries)
+        self._retry_backoff_s = max(0.0, retry_backoff_s)
         # internal_name → backend slug. Populated by the registry so call
         # sites can use the same model names everywhere. Unknown models pass
         # through unchanged (the common case for local model names).
         self._slug_lookup = slug_lookup or {}
-        self._spec_lookup = spec_lookup or {}
+        # Thinking is unrepresentable in the OpenAI wire format regardless of
+        # which model is behind it, so normalize every incoming spec rather
+        # than trusting callers to remember. FeatureSpec() defaults
+        # supports_thinking=True; a default-constructed spec reaching here
+        # would otherwise skip the gate and make to_openai_request raise
+        # mid-turn. Normalizing keeps that raise a true invariant guard.
+        self._spec_lookup = {
+            model: _without_thinking(spec) for model, spec in (spec_lookup or {}).items()
+        }
 
     # ------------------------------------------------------------------
     # internal helpers
@@ -97,6 +295,44 @@ class OpenAICompatibleProvider:
         )
         return slug, spec
 
+    def _gate(self, slug: str, spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Apply the feature gate, reporting anything it had to remove.
+
+        The gate on its own is silent, which is how a caller could ask for
+        deep reasoning and never learn it did not happen. Logging the removed
+        capabilities here — once per request, with the resolved slug — is the
+        difference between a gated capability and a lost one.
+        """
+        dropped = unsupported_requested(spec, kwargs)
+        if dropped:
+            logger.warning(
+                "model %s does not support %s; removing from request "
+                "(requested but not delivered)",
+                slug,
+                ", ".join(dropped),
+            )
+        return apply_feature_gates(spec, kwargs)
+
+    async def _post_with_retry(self, body: dict[str, Any], timeout: Any) -> httpx.Response:
+        """POST /chat/completions with bounded retries on transient failures."""
+
+        async def _once() -> httpx.Response:
+            resp = await self._client.post(
+                "/chat/completions",
+                json=body,
+                headers=self._auth_headers(),
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp
+
+        return await _with_retry(
+            _once,
+            label=f"backend {body.get('model')}",
+            max_retries=self._max_retries,
+            backoff_s=self._retry_backoff_s,
+        )
+
     def _auth_headers(self) -> dict[str, str]:
         # Local backends (Ollama, LM Studio) typically need no auth — omit
         # the header entirely rather than send a bogus ``Bearer None``.
@@ -117,32 +353,20 @@ class OpenAICompatibleProvider:
         request_timeout = kwargs.pop("timeout", None)
         model = kwargs.pop("model", "")
         slug, spec = self._resolve(model)
-        gated = apply_feature_gates(spec, kwargs)
+        gated = self._gate(slug, spec, kwargs)
         body = to_openai_request(slug, gated)
 
-        try:
-            resp = await self._client.post(
-                "/chat/completions",
-                json=body,
-                headers=self._auth_headers(),
-                timeout=request_timeout if request_timeout is not None else httpx.USE_CLIENT_DEFAULT,
-            )
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                "OpenAI-compatible backend %s returned %s: %s",
-                slug,
-                exc.response.status_code,
-                exc.response.text[:500],
-            )
-            raise
+        resp = await self._post_with_retry(
+            body,
+            request_timeout if request_timeout is not None else httpx.USE_CLIENT_DEFAULT,
+        )
         return from_openai_response(resp.json())
 
     def messages_stream(self, **kwargs: Any) -> AbstractAsyncContextManager[Any]:
         request_timeout = kwargs.pop("timeout", None)
         model = kwargs.pop("model", "")
         slug, spec = self._resolve(model)
-        gated = apply_feature_gates(spec, kwargs)
+        gated = self._gate(slug, spec, kwargs)
         body = to_openai_request(slug, gated)
         body["stream"] = True
         return _OpenAICompatibleStream(
@@ -150,6 +374,8 @@ class OpenAICompatibleProvider:
             body=body,
             headers=self._auth_headers(),
             timeout=request_timeout,
+            max_retries=self._max_retries,
+            retry_backoff_s=self._retry_backoff_s,
         )
 
     async def aclose(self) -> None:
@@ -175,17 +401,72 @@ class _OpenAICompatibleStream:
         body: dict[str, Any],
         headers: dict[str, str],
         timeout: float | None,
+        max_retries: int = _DEFAULT_MAX_RETRIES,
+        retry_backoff_s: float = _DEFAULT_RETRY_BACKOFF_S,
     ) -> None:
         self._client = client
         self._body = body
         self._headers = headers
         self._timeout = timeout
+        self._max_retries = max(0, max_retries)
+        self._retry_backoff_s = max(0.0, retry_backoff_s)
         self._response_cm: contextlib.AbstractAsyncContextManager[httpx.Response] | None = None
         self._response: httpx.Response | None = None
         self._accumulator = StreamAccumulator()
         self._finalized: SimpleNamespace | None = None
 
     async def __aenter__(self) -> _OpenAICompatibleStream:
+        """Open the SSE response, retrying transient failures.
+
+        Retrying here is safe because it happens strictly before any event is
+        yielded to the consumer — a failed attempt produced no partial output.
+        Once iteration starts we never retry, since half a reply cannot be
+        replayed. Matches the Anthropic SDK, which also retries only the
+        request that establishes the stream.
+        """
+        await _with_retry(
+            self._open_once,
+            label=f"stream {self._body.get('model')}",
+            max_retries=self._max_retries,
+            backoff_s=self._retry_backoff_s,
+            on_retry=self._reset_for_retry,
+        )
+        return self
+
+    async def _reset_for_retry(self) -> None:
+        """Release the failed attempt's connection and drop its partial state.
+
+        Closing first is what keeps a retry from orphaning the previous
+        response context — ``_open_once`` would otherwise overwrite
+        ``_response_cm`` and the old one would never be exited.
+        """
+        await self._close_response_cm()
+        self._accumulator = StreamAccumulator()
+
+    async def _close_response_cm(self) -> None:
+        """Exit and forget the current response context, if one is open.
+
+        Every failure path must run this before the next attempt: otherwise
+        ``_open_once`` overwrites ``_response_cm`` with a fresh context and the
+        previous one is never exited, orphaning its connection. Enough of those
+        exhausts the httpx pool and every later call blocks on PoolTimeout.
+        """
+        if self._response_cm is None:
+            return
+        cm, self._response_cm, self._response = self._response_cm, None, None
+        try:
+            await cm.__aexit__(None, None, None)
+        except Exception as exc:
+            # Must not propagate: this runs from a ``finally`` while an
+            # HTTPStatusError is in flight, and replacing that exception would
+            # destroy the retry classification. But a failure here means the
+            # connection was NOT returned to the pool — the very thing this
+            # method exists to guarantee — so it is logged rather than
+            # swallowed silently. CancelledError is a BaseException and still
+            # propagates, which is correct.
+            logger.warning("failed to close response context: %s", _describe(exc))
+
+    async def _open_once(self) -> None:
         # ``client.stream(...)`` is a context manager; we open it here and
         # close it in ``__aexit__`` so callers get the same scoping as
         # Anthropic's manager.
@@ -196,31 +477,42 @@ class _OpenAICompatibleStream:
             headers=self._headers,
             timeout=self._timeout if self._timeout is not None else httpx.USE_CLIENT_DEFAULT,
         )
-        self._response = await self._response_cm.__aenter__()
+        try:
+            self._response = await self._response_cm.__aenter__()
+        except BaseException:
+            # The context was never entered, so __aexit__ must not run on it.
+            # Clearing here keeps a retry (or the caller's __aexit__) from
+            # exiting a context that was never opened.
+            self._response_cm = None
+            self._response = None
+            raise
         # If the backend returned a non-2xx we must close the response context
         # ourselves — the outer ``async with`` will NOT call __aexit__ when
         # __aenter__ raises, so a naive ``raise_for_status`` would leak the
         # connection back to the pool half-read.
+        #
+        # The whole block is guarded, not just raise_for_status: reading the
+        # error body can itself fail mid-read (ReadError / RemoteProtocolError),
+        # and an unguarded read would leave the context open for a retry to
+        # overwrite.
         if self._response.status_code >= 400:
-            text = await self._response.aread()
-            logger.error(
-                "OpenAI-compatible stream returned %s: %s",
-                self._response.status_code,
-                text.decode("utf-8", errors="replace")[:500],
-            )
             try:
+                # Buffer the body before closing so the terminal-failure log
+                # (via _log_terminal_failure) can still read exc.response.text.
+                await self._response.aread()
                 self._response.raise_for_status()
             finally:
-                await self._response_cm.__aexit__(None, None, None)
-                self._response_cm = None
-                self._response = None
-        return self
+                await self._close_response_cm()
 
     async def __aexit__(self, *exc_info: Any) -> None:
-        if self._response_cm is not None:
-            await self._response_cm.__aexit__(*exc_info)
+        cm = self._response_cm
+        # Null FIRST so the "every path leaves no live context behind"
+        # invariant holds even if __aexit__ itself raises — otherwise the
+        # fields would keep pointing at a dead object.
         self._response_cm = None
         self._response = None
+        if cm is not None:
+            await cm.__aexit__(*exc_info)
 
     def __aiter__(self) -> AsyncIterator[Any]:
         return self._iter_events()

@@ -57,9 +57,22 @@ _CLAUDE_OPENROUTER_SLUGS: dict[str, str] = {
 }
 
 
+# Claude routed through an OpenAI-format backend. cache_control and
+# web_search DO survive translation (as Anthropic cache hints OpenRouter
+# forwards upstream, and as OpenRouter's `web` plugin respectively), so
+# they stay on.
+#
+# `supports_thinking` is FALSE even though the upstream model supports it:
+# the OpenAI `/chat/completions` body has no field this codebase can prove
+# carries Anthropic's `thinking` / `output_config.effort`, and
+# `to_openai_request` therefore does not emit one. Declaring it False makes
+# the gate strip it — which the provider logs — instead of the translator
+# discarding it invisibly. Capability-honest beats optimistic: a caller can
+# see the loss, and Anthropic-direct routing is unaffected (it never runs
+# the gate).
 _CLAUDE_FEATURE_SPEC = FeatureSpec(
     supports_cache_control=True,
-    supports_thinking=True,
+    supports_thinking=False,
     supports_web_search=True,
     supports_tool_use=True,
 )
