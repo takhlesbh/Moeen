@@ -58,6 +58,24 @@ logger = logging.getLogger(__name__)
 # refuse rather than emit a body that silently lacks the capability.
 _UNREPRESENTABLE_REQUEST_FIELDS = ("thinking", "output_config")
 
+# Sampling controls that carry the SAME name in both wire formats, so they need
+# no translation — only forwarding. Each is emitted strictly when the caller
+# supplied it and it is not None: this module never invents a default, because
+# a default invented here would be indistinguishable from a caller's explicit
+# choice and would silently change every existing request. Per-backend defaults
+# belong to the provider seam (``OpenAICompatibleProvider.default_params``),
+# which fills a value in BEFORE translation and only when the caller is silent.
+#
+# ``presence_penalty`` / ``frequency_penalty`` have no Anthropic equivalent at
+# all; they are accepted here because the provider surface is a superset —
+# Anthropic-direct routing never reaches this function.
+_PASSTHROUGH_SAMPLING_FIELDS = (
+    "temperature",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+)
+
 # Reasoning/thinking text some OpenAI-compatible backends return alongside
 # ``content``. We deliberately do NOT synthesize an Anthropic ``thinking``
 # block from it: we never asked for reasoning (the gate strips the request
@@ -376,9 +394,33 @@ def to_openai_request(model_slug: str, anthropic_kwargs: dict[str, Any]) -> dict
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
 
-    temperature = anthropic_kwargs.get("temperature")
-    if temperature is not None:
-        body["temperature"] = temperature
+    for field in _PASSTHROUGH_SAMPLING_FIELDS:
+        value = anthropic_kwargs.get(field)
+        if value is not None:
+            body[field] = value
+
+    # Anthropic spells this ``stop_sequences``; OpenAI spells it ``stop``. A
+    # caller may legitimately use either — the provider surface is documented
+    # as Anthropic-shaped, but a per-backend default (see
+    # ``OpenAICompatibleProvider.default_params``) is naturally written in the
+    # wire format's own vocabulary. An explicit ``stop`` wins so the more
+    # specific spelling is never silently overridden by the alias.
+    stop = anthropic_kwargs.get("stop")
+    if stop is None:
+        stop = anthropic_kwargs.get("stop_sequences")
+    if stop is not None:
+        body["stop"] = stop
+
+    # Backend-specific reasoning control. Unlike ``thinking`` /
+    # ``output_config`` this IS representable in the OpenAI wire format, but
+    # only some backends honour it — so it is gated per-model by
+    # ``FeatureSpec.supports_reasoning_effort`` rather than declared globally
+    # unrepresentable. By the time we run, the gate has already stripped it
+    # for any backend that cannot honour it (and the provider logged the
+    # removal), so anything still here was explicitly supported.
+    reasoning_effort = anthropic_kwargs.get("reasoning_effort")
+    if reasoning_effort is not None:
+        body["reasoning_effort"] = reasoning_effort
 
     tools = anthropic_kwargs.get("tools")
     if tools:

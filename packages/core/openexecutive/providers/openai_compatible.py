@@ -247,6 +247,7 @@ class OpenAICompatibleProvider:
         timeout_s: float = 180.0,
         slug_lookup: dict[str, str] | None = None,
         spec_lookup: dict[str, FeatureSpec] | None = None,
+        default_params: dict[str, Any] | None = None,
         max_retries: int = _DEFAULT_MAX_RETRIES,
         retry_backoff_s: float = _DEFAULT_RETRY_BACKOFF_S,
     ) -> None:
@@ -274,6 +275,13 @@ class OpenAICompatibleProvider:
         self._spec_lookup = {
             model: _without_thinking(spec) for model, spec in (spec_lookup or {}).items()
         }
+        # Per-backend request defaults, in Anthropic-kwargs shape, applied only
+        # where the caller said nothing (see ``_apply_defaults``). This is the
+        # seam that lets a self-hosted backend carry its own sampling /
+        # reasoning profile without any call site — Executive, specialists,
+        # workflows — knowing which model is behind the endpoint. Empty for
+        # OpenRouter, so its requests are byte-identical to before.
+        self._default_params = dict(default_params or {})
 
     # ------------------------------------------------------------------
     # internal helpers
@@ -294,6 +302,33 @@ class OpenAICompatibleProvider:
             ),
         )
         return slug, spec
+
+    def _apply_defaults(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Fill in this backend's defaults for keys the caller left unset.
+
+        An explicit caller value always wins — including an explicit ``0`` or
+        ``0.0``, which is why the test is ``is None`` and not falsiness: a
+        caller asking for ``temperature=0`` means deterministic sampling, and a
+        truthiness test would silently replace it with the backend default.
+
+        Runs BEFORE the feature gate, so a default this backend turns out not
+        to support is stripped and reported by the same machinery that polices
+        caller-supplied features — a misconfigured default cannot smuggle a
+        capability past the gate.
+
+        Never mutates the caller's dict: it is reused across the retry path,
+        and the copy is made only when a default actually applies so the
+        common (no-defaults) case stays allocation-free.
+        """
+        if not self._default_params:
+            return kwargs
+        out: dict[str, Any] | None = None
+        for key, value in self._default_params.items():
+            if kwargs.get(key) is None:
+                if out is None:
+                    out = dict(kwargs)
+                out[key] = value
+        return out if out is not None else kwargs
 
     def _gate(self, slug: str, spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Apply the feature gate, reporting anything it had to remove.
@@ -353,7 +388,7 @@ class OpenAICompatibleProvider:
         request_timeout = kwargs.pop("timeout", None)
         model = kwargs.pop("model", "")
         slug, spec = self._resolve(model)
-        gated = self._gate(slug, spec, kwargs)
+        gated = self._gate(slug, spec, self._apply_defaults(kwargs))
         body = to_openai_request(slug, gated)
 
         resp = await self._post_with_retry(
@@ -366,7 +401,7 @@ class OpenAICompatibleProvider:
         request_timeout = kwargs.pop("timeout", None)
         model = kwargs.pop("model", "")
         slug, spec = self._resolve(model)
-        gated = self._gate(slug, spec, kwargs)
+        gated = self._gate(slug, spec, self._apply_defaults(kwargs))
         body = to_openai_request(slug, gated)
         body["stream"] = True
         return _OpenAICompatibleStream(

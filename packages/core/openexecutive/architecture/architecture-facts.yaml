@@ -41,8 +41,23 @@ system:
       in LOCAL_MODELS route to a self-hosted OpenAI-compatible server
       (Ollama / LM Studio / vLLM / llama.cpp) through the same provider seam,
       reusing the OpenRouter request/response/stream translator. Those slugs
-      are added to the Council UI dropdown and get the non-Claude feature
-      spec (no cache_control / thinking / web_search). This makes
+      are added to the Council UI dropdown and get a local feature spec:
+      the non-Claude one (no cache_control / thinking / web_search) plus
+      supports_reasoning_effort=True, which is enabled for the local
+      backend and nowhere else — an OpenRouter model still has
+      reasoning_effort stripped and reported.
+      The local backend also carries per-request defaults
+      (LOCAL_TEMPERATURE / LOCAL_TOP_P / LOCAL_PRESENCE_PENALTY /
+      LOCAL_REASONING_EFFORT). Each is sent only when the operator sets it
+      AND the caller passed nothing, so a self-hosted model's sampling and
+      reasoning profile lives with the backend instead of at every call
+      site; unset means the field is omitted entirely. Defaults are applied
+      BEFORE the feature gate, so a default the backend cannot honour is
+      stripped and logged like any caller-supplied field. Context length is
+      deliberately NOT an application setting — no OpenAI-compatible
+      endpoint exposes it, so it stays the server's responsibility
+      (OLLAMA_CONTEXT_LENGTH / llama-server -c); a measured Executive turn
+      is ~20k input tokens, ~15k of which is tool definitions. This makes
       ANTHROPIC_API_KEY optional: a deployment with only local (or
       OpenRouter) models configured boots with no Anthropic key — the
       Settings validator just requires that at least one provider is
@@ -158,8 +173,13 @@ providers:
     openexecutive.providers.feature_gate.apply_feature_gates(spec, kwargs)
     runs inside the OpenRouter provider before translation. Spec-driven
     stripping covers cache_control on system/tool/user blocks, adaptive
-    thinking + output_config, and Anthropic server-side web_search
-    tools. A misrouted call cannot ship an unsupported field.
+    thinking + output_config, Anthropic server-side web_search tools, and
+    reasoning_effort. A misrouted call cannot ship an unsupported field.
+    reasoning_effort differs from the others in direction: it IS
+    representable in the OpenAI wire format, so it is gated per-backend
+    (FeatureSpec.supports_reasoning_effort, default False) rather than
+    declared globally unrepresentable — it never raises
+    UnsupportedFeatureError, it is stripped and reported.
   translator_shapes: |
     Anthropic ``system`` list → OpenAI single ``system`` message;
     Anthropic ``tools[].input_schema`` → OpenAI ``tools[].function.parameters``;

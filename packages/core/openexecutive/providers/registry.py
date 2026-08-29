@@ -89,6 +89,50 @@ _DEFAULT_NON_CLAUDE_SPEC = FeatureSpec(
 )
 
 
+# Self-hosted OpenAI-compatible backends get the non-Claude spec plus the one
+# capability they genuinely have: the OpenAI-format ``reasoning_effort`` field.
+# Kept separate from ``_DEFAULT_NON_CLAUDE_SPEC`` so enabling it for local
+# routing cannot leak into the OpenRouter models that share that spec.
+_LOCAL_FEATURE_SPEC = FeatureSpec(
+    supports_cache_control=False,
+    supports_thinking=False,
+    supports_web_search=False,
+    supports_tool_use=True,
+    supports_reasoning_effort=True,
+)
+
+
+# Settings field → Anthropic-kwargs key for the local backend's request
+# defaults. Only keys whose setting is actually set are forwarded, so an
+# unconfigured deployment sends exactly what it sent before.
+_LOCAL_DEFAULT_PARAM_FIELDS: tuple[tuple[str, str], ...] = (
+    ("local_temperature", "temperature"),
+    ("local_top_p", "top_p"),
+    ("local_presence_penalty", "presence_penalty"),
+    ("local_reasoning_effort", "reasoning_effort"),
+)
+
+
+def _local_default_params(settings: Any) -> dict[str, Any]:
+    """Per-request defaults for the local backend, from settings.
+
+    Read defensively via ``getattr`` for the same reason ``_local_models``
+    does: lightweight test settings stubs may not define these fields.
+
+    ``None`` means "operator did not configure this", so the key is omitted
+    entirely and the backend's own default applies. A configured ``0`` /
+    ``0.0`` IS forwarded — ``presence_penalty=0`` is a meaningful instruction
+    to a model whose built-in default is non-zero, which is precisely the case
+    this seam exists to handle.
+    """
+    params: dict[str, Any] = {}
+    for field, wire_key in _LOCAL_DEFAULT_PARAM_FIELDS:
+        value = getattr(settings, field, None)
+        if value is not None:
+            params[wire_key] = value
+    return params
+
+
 def _local_models(settings: Any) -> list[str]:
     """Configured local model slugs, or ``[]`` when local routing is off.
 
@@ -180,14 +224,22 @@ def _local() -> OpenAICompatibleProvider:
         # Local models get the non-Claude feature spec: no cache_control,
         # thinking, or server-side web_search — those are Anthropic-only and
         # would 400 (or be silently ignored) on an OpenAI-compatible server.
+        #
+        # ``reasoning_effort`` is the one capability a self-hosted backend has
+        # that OpenRouter's curated set does not expose uniformly, so it is
+        # enabled here and nowhere else. Declaring it here (rather than in the
+        # shared non-Claude spec) is what keeps OpenRouter fail-honest: a
+        # reasoning_effort sent to an OpenRouter model is still stripped and
+        # reported, exactly as before this flag existed.
         spec_lookup: dict[str, FeatureSpec] = {
-            m: _DEFAULT_NON_CLAUDE_SPEC for m in _local_models(settings)
+            m: _LOCAL_FEATURE_SPEC for m in _local_models(settings)
         }
         _local_provider = OpenAICompatibleProvider(
             base_url=base_url,
             api_key=getattr(settings, "local_api_key", None),
             timeout_s=getattr(settings, "local_timeout_s", 300.0),
             spec_lookup=spec_lookup,
+            default_params=_local_default_params(settings),
         )
     return _local_provider
 

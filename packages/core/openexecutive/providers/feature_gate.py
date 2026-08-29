@@ -39,15 +39,25 @@ class UnsupportedFeatureError(RuntimeError):
 class FeatureSpec:
     """What a given model is allowed to receive.
 
-    All four flags default to True for Claude family; the registry's
-    ``MODEL_SPECS`` table flips them off for non-Claude models so a
+    The four Anthropic-only flags default to True for Claude family; the
+    registry's ``MODEL_SPECS`` table flips them off for non-Claude models so a
     misconfigured caller can't bypass the gate.
+
+    ``supports_reasoning_effort`` is the odd one out and defaults to **False**
+    on purpose. The other four describe Anthropic features we may need to strip;
+    this one describes an OpenAI-format field (``reasoning_effort``) that only
+    some backends honour. Defaulting it off makes the flag purely additive — every
+    spec that existed before it was introduced keeps its exact behaviour — and
+    keeps the failure direction safe: a backend that was never declared capable
+    has the field stripped and reported rather than silently receiving a control
+    it will ignore.
     """
 
     supports_cache_control: bool = True
     supports_thinking: bool = True
     supports_web_search: bool = True
     supports_tool_use: bool = True
+    supports_reasoning_effort: bool = False
 
 
 def apply_feature_gates(spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -61,6 +71,13 @@ def apply_feature_gates(spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, 
         and spec.supports_thinking
         and spec.supports_web_search
         and spec.supports_tool_use
+        # ``reasoning_effort`` is checked against the REQUEST, not just the
+        # spec. It is the only flag that defaults off, so keying the fast path
+        # on the flag alone would deny the allocation-free path to every
+        # Anthropic-shaped call — which is the case this fast path exists for,
+        # and which never carries the field anyway. Testing presence keeps that
+        # path free while still stripping a field a backend cannot honour.
+        and (spec.supports_reasoning_effort or kwargs.get("reasoning_effort") is None)
     ):
         # Fast path: nothing to strip.
         return kwargs
@@ -81,6 +98,9 @@ def apply_feature_gates(spec: FeatureSpec, kwargs: dict[str, Any]) -> dict[str, 
         out.pop("tools", None)
         out.pop("tool_choice", None)
 
+    if not spec.supports_reasoning_effort:
+        out.pop("reasoning_effort", None)
+
     return out
 
 
@@ -93,9 +113,10 @@ def unsupported_requested(spec: FeatureSpec, kwargs: dict[str, Any]) -> list[str
     call it on the pre-gate kwargs.
 
     Returns a stable, sorted list of capability names matching the
-    ``FeatureSpec`` flags (``cache_control``, ``thinking``, ``tool_use``,
-    ``web_search``). Empty when the request asks for nothing the model
-    cannot do — which is the common case and the fast path.
+    ``FeatureSpec`` flags (``cache_control``, ``reasoning_effort``,
+    ``thinking``, ``tool_use``, ``web_search``). Empty when the request asks
+    for nothing the model cannot do — which is the common case and the fast
+    path.
     """
     found: list[str] = []
 
@@ -114,6 +135,9 @@ def unsupported_requested(spec: FeatureSpec, kwargs: dict[str, Any]) -> list[str
         kwargs.get("tools") or kwargs.get("tool_choice") is not None
     ):
         found.append("tool_use")
+
+    if not spec.supports_reasoning_effort and kwargs.get("reasoning_effort") is not None:
+        found.append("reasoning_effort")
 
     if not spec.supports_web_search and _has_web_search_tool(kwargs):
         found.append("web_search")
