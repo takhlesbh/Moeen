@@ -9,12 +9,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-# Single source of truth for the judge model. Defined here (the leaf module)
-# and imported by run_evals, so the model a provider is resolved FOR can never
-# drift from the model the request is labelled WITH — a mismatch would route
-# by one slug and send another, and the OpenAI-compatible path passes unknown
-# slugs upstream unchanged.
-JUDGE_MODEL = "claude-opus-4-7"
+from judges.base import JUDGE_MODEL, invoke_judge
+
+__all__ = ["JUDGE_MODEL", "judge_triage"]
 
 
 def _format_decision(decision: dict[str, Any]) -> str:
@@ -107,16 +104,8 @@ Respond in JSON:
 {{"severity_accuracy": N, "channel_appropriateness": N, "dedup_correctness": N, "overall": N, "notes": "brief explanation"}}
 """
 
-    message = await provider.messages_create(
-        model=JUDGE_MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": judge_prompt}],
-    )
-
-    text = message.content[0].text  # type: ignore[union-attr]
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except Exception:
-        return {"overall": 0, "notes": "Failed to parse triage judge response"}
+    # Routed through the shared contract: a parse failure raises JudgeError
+    # instead of returning {"overall": 0}. The old fail-open turned a judge
+    # outage into a fabricated product failure that a run could still report
+    # as COMPLETE.
+    return await invoke_judge(provider, judge_prompt)

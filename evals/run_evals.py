@@ -11,10 +11,7 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
-
-import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "packages" / "core"))
 
@@ -25,10 +22,33 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "packages" / "core"))
 # a local backend does not have the judge silently pinned to a direct
 # Anthropic connection.
 sys.path.insert(0, str(Path(__file__).parent))
-from judges.triage_judge import JUDGE_MODEL  # noqa: E402
+from evidence import (  # noqa: E402
+    OUTCOME_ERROR,
+    OUTCOME_FAIL,
+    OUTCOME_PASS,
+    RunEvidence,
+    harvest_audit,
+    new_run_id,
+)
+from judges.base import JUDGE_MODEL, JudgeError, invoke_judge  # noqa: E402
+from preflight import (  # noqa: E402
+    RETRIEVAL_COLLECTIONS,
+    PreflightError,
+    assert_runtime_store_identity,
+    load_inventory,
+    observe_collections,
+)
+from preflight import required_collections_for as _required_collections  # noqa: E402
+from preflight import resolve_store_path, validate_knowledge  # noqa: E402
+
+PASS_THRESHOLD = 3.5
+# Fraction of executed scenarios that must pass before the command reports
+# success. Distinct from the infrastructure gates: this one is a judgement
+# about the product, not the harness.
+MIN_PASS_RATE = 0.8
 
 
-async def run_eval(scenario: dict, executive, session_factory) -> dict:
+async def run_eval(scenario: dict, executive) -> dict:
     from openexecutive.memory.company_profile import CompanyProfile
     from openexecutive.orchestrator.session import Session
 
@@ -59,6 +79,10 @@ async def run_eval(scenario: dict, executive, session_factory) -> dict:
         "query": scenario["query"],
         "response": response,
         "response_length": len(response),
+        # Correlates this scenario to the audit rows the Executive wrote for
+        # it — the only handle by which specialist consults and per-iteration
+        # token usage can be recovered afterwards.
+        "session_id": session.session_id,
     }
 
 
@@ -83,19 +107,7 @@ Rate each dimension (1=poor, 3=acceptable, 5=excellent):
 Respond in JSON format:
 {{"persona_coherence": N, "domain_accuracy": N, "actionability": N, "topic_coverage": N, "specificity": N, "overall": N, "notes": "brief explanation"}}"""
 
-    message = await provider.messages_create(
-        model=JUDGE_MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": judge_prompt}],
-    )
-
-    text = message.content[0].text
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except Exception:
-        return {"overall": 0, "notes": "Failed to parse judge response"}
+    return await invoke_judge(provider, judge_prompt)
 
 
 async def run_workflow_eval(scenario: dict, store) -> dict:
@@ -159,19 +171,7 @@ Rate each dimension 1-5 (1=poor, 3=acceptable, 5=excellent):
 Respond in JSON:
 {{"structure": N, "specificity": N, "actionability": N, "coherence": N, "completeness": N, "overall": N, "notes": "brief"}}"""
 
-    message = await provider.messages_create(
-        model=JUDGE_MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": judge_prompt}],
-    )
-
-    text = message.content[0].text
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except Exception:
-        return {"overall": 0, "notes": "Failed to parse judge response"}
+    return await invoke_judge(provider, judge_prompt)
 
 
 async def run_triage_eval(scenario: dict) -> dict:
@@ -211,16 +211,167 @@ async def run_triage_eval(scenario: dict) -> dict:
     }
 
 
-async def main() -> None:
+
+def _kind_from_args(args: argparse.Namespace) -> str:
+    if args.triage:
+        return "triage"
+    if args.workflow:
+        return "workflow"
+    if args.mcp:
+        return "mcp"
+    return "chat"
+
+
+def _judge_error_result(
+    scenario: dict, partial: dict, exc: JudgeError, duration_ms: int
+) -> dict:
+    """A scenario whose verdict could not be obtained.
+
+    Keeps the model's own output — it was produced successfully and is worth
+    inspecting — but records NO score, because none exists.
+    """
+    return {
+        **partial,
+        "outcome": OUTCOME_ERROR,
+        "error_kind": "judge_unparseable",
+        "error": str(exc),
+        "judge": None,
+        "judge_raw": exc.raw,
+        "duration_ms": duration_ms,
+    }
+
+
+async def _score(scenario: dict, partial: dict, verdict: dict, duration_ms: int) -> dict:
+    raw = verdict.pop("_raw", "")
+    overall = verdict.get("overall", 0.0)
+    return {
+        **partial,
+        "outcome": OUTCOME_PASS if overall >= PASS_THRESHOLD else OUTCOME_FAIL,
+        "judge": verdict,
+        "judge_raw": raw,
+        "judge_model": JUDGE_MODEL,
+        "pass_threshold": PASS_THRESHOLD,
+        "duration_ms": duration_ms,
+    }
+
+
+def _print_preflight(kind, source_dir, inventory, knowledge, census=None) -> None:
+    """Echo what the run resolved to, so a wrong store or inventory is visible
+    in the log before any money is spent."""
+    print(f"run kind        : {kind}")
+    print(f"scenario source : {source_dir}")
+    print(
+        f"discovered      : {inventory['discovered_count']} "
+        f"(all kinds: {inventory['kind_totals']})"
+    )
+    print(f"knowledge store : {knowledge.persist_path}")
+    for name, info in knowledge.collections.items():
+        print(f"  {name}: {info['count']} chunks, dim={info.get('dimension')}")
+    print(f"kb fingerprint  : {knowledge.fingerprint}")
+    if knowledge.smoke_results:
+        top = knowledge.smoke_results[0]
+        print(f"retrieval smoke : OK — top={top['source']} d={top['distance']}")
+    if census is not None:
+        absent = [n for n, v in census.items() if not v["present"]]
+        print(f"retrieval reads : {', '.join(census)}")
+        if absent:
+            print(f"  NOT in store  : {', '.join(absent)} (will be auto-created EMPTY)")
+
+
+
+def _prepare_environment(args: argparse.Namespace) -> Path:
+    """Pin every path to an absolute value BEFORE Settings is first read.
+
+    This is the whole of defect 2: a relative ``VECTOR_STORE_PATH`` is
+    re-resolved against ``Path.cwd()`` by ``Settings._resolve_paths``, so the
+    Makefile's ``cd packages/core`` silently retargeted the knowledge store to
+    a path that did not exist — which Chroma then created, empty.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    if args.scenarios:
+        os.environ["EVAL_SCENARIOS_PATH"] = str(
+            Path(args.scenarios).expanduser().resolve()
+        )
+    store_path = resolve_store_path(args.vector_store, repo_root)
+    os.environ["VECTOR_STORE_PATH"] = str(store_path)
+    # packages/core/company/ — NOT <repo_root>/company/. Only the former is
+    # gitignored, and CLAUDE.md designates it as where company data lives.
+    # Pointing the harness at the repo root would put company-confidential
+    # data one `git add -A` away from a commit.
+    os.environ.setdefault(
+        "COMPANY_PROFILE_PATH",
+        str(repo_root / "packages" / "core" / "company" / "profile.yaml"),
+    )
+    return store_path
+
+
+def _resolve_output_root(explicit: str | None) -> Path:
+    """Where run evidence is written, refusing git-tracked destinations.
+
+    Evidence embeds complete specialist prompts and responses — which carry the
+    company profile and retrieved company_docs chunks — so a destination inside
+    the repo but outside the gitignored ``evals/results/`` is one ``git add -A``
+    away from committing confidential data. Both branches resolve fully first,
+    so a symlinked ``evals/results`` cannot dodge the check.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    default_root = (repo_root / "evals" / "results").resolve()
+    root = (
+        Path(explicit).expanduser().resolve() if explicit else default_root
+    )
+    inside_repo = root == repo_root or repo_root in root.parents
+    inside_default = root == default_root or default_root in root.parents
+    if inside_repo and not inside_default:
+        raise PreflightError(
+            f"Refusing to write run evidence to {root}\n"
+            f"It is inside the repository but outside the gitignored "
+            f"{default_root}. Evidence contains full specialist prompts and "
+            f"company context — writing it to a tracked path risks committing "
+            f"it. Use the default, or an --output outside the repo."
+        )
+    return root
+
+
+def _initialize_schemas() -> None:
+    """Create the SQLite schemas the API server's lifespan normally creates.
+
+    The chat path's RAG layer reads ``review_items``, and the workflow path
+    additionally touches ``decisions`` / ``agent_overrides``. Without this every
+    specialist consult dies with ``no such table``.
+    """
+    from openexecutive.agents.overrides import initialize_overrides_db
+    from openexecutive.knowledge.review_store import ReviewStore
+    from openexecutive.memory.episodic import initialize_db as initialize_episodic_db
+
+    initialize_episodic_db()
+    initialize_overrides_db()
+    ReviewStore.initialize_db()
+
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """CLI surface. Kept separate so main() reads as a sequence of
+    phases rather than fifty lines of flag declarations."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--scenarios",
-        default="../packages/core/openexecutive/evals/_scenarios/",
-        help="Path to scenario YAML files (moved into the package; pass an "
-        "explicit path to use a custom set)",
+        help="Directory of scenario YAML files. Defaults to the packaged "
+        "openexecutive/evals/_scenarios/ (exported as EVAL_SCENARIOS_PATH so "
+        "the package loader — the single source of discovery — resolves it).",
     )
-    parser.add_argument("--output", default="results/", help="Output directory for results")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Root directory for run evidence. Defaults to <repo>/evals/results/, "
+        "which is gitignored — evidence embeds full specialist prompts and "
+        "responses, so a CWD-relative default risked committing them.",
+    )
     parser.add_argument("--scenario-id", help="Run only this scenario ID")
+    parser.add_argument(
+        "--vector-store",
+        help="Chroma persistence directory to evaluate against. Must already "
+        "exist — the harness never creates one.",
+    )
     parser.add_argument(
         "--triage",
         action="store_true",
@@ -239,133 +390,191 @@ async def main() -> None:
             "so they are skipped unless this flag is set."
         ),
     )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Validate inventory + knowledge store and write the manifest, "
+        "then exit without making any model call.",
+    )
+    return parser
+
+
+async def main() -> int:
+    parser = _build_parser()
     args = parser.parse_args()
-    mode_flags = [args.triage, args.workflow, args.mcp]
-    if sum(mode_flags) > 1:
+    if sum([args.triage, args.workflow, args.mcp]) > 1:
         parser.error("--triage, --workflow, and --mcp are mutually exclusive")
 
-    os.environ.setdefault("COMPANY_PROFILE_PATH", "./company/profile.yaml")
-    os.environ.setdefault("VECTOR_STORE_PATH", "./chroma_db")
+    store_path = _prepare_environment(args)
+    _initialize_schemas()
+    kind = _kind_from_args(args)
 
-    # The chat path's RAG layer reads ``review_items`` from the shared
-    # episodic_memory.db, and the workflow path additionally touches
-    # ``decisions`` / ``agent_overrides``. The API server's lifespan
-    # initializes these schemas; the eval runner must do the same or every
-    # specialist consult will explode with ``no such table``.
-    from openexecutive.agents.overrides import initialize_overrides_db
-    from openexecutive.knowledge.review_store import ReviewStore
-    from openexecutive.memory.episodic import initialize_db as initialize_episodic_db
+    # ---- Preflight. Every failure below is fatal and non-zero. ----------
+    try:
+        # Validated first: a destination that would leak evidence into a
+        # tracked path should fail before anything is discovered or opened.
+        output_root = _resolve_output_root(args.output)
+        scenarios, source_dir, inventory = load_inventory(kind, args.scenario_id)
+        required = _required_collections(scenarios)
+        knowledge = validate_knowledge(store_path, required)
+        # Prove the store retrieval will actually open is the one just
+        # validated, and census every collection retrieval can read so an
+        # auto-created empty one is visible up front rather than silently
+        # standing in for a validated source.
+        runtime_path = assert_runtime_store_identity(store_path)
+        retrieval_census = observe_collections(store_path, RETRIEVAL_COLLECTIONS)
+    except PreflightError as exc:
+        print(f"\nPREFLIGHT FAILED\n{exc}\n", file=sys.stderr)
+        return 2
 
-    initialize_episodic_db()
-    initialize_overrides_db()
-    ReviewStore.initialize_db()
+    _print_preflight(kind, source_dir, inventory, knowledge, retrieval_census)
+
+    # ---- Evidence directory. Manifest exists BEFORE the first call. -----
+    output_root.mkdir(parents=True, exist_ok=True)
+    run = RunEvidence(output_root, new_run_id())
+    run.open_manifest(
+        kind=kind,
+        inventory=inventory,
+        knowledge=knowledge.to_dict()
+        | {
+            "runtime_path_verified": str(runtime_path),
+            "retrieval_collections": retrieval_census,
+        },
+        config={
+            "judge_model": JUDGE_MODEL,
+            "pass_threshold": PASS_THRESHOLD,
+            "scenario_source": str(source_dir),
+            "vector_store_path": str(store_path),
+            "scenario_id_filter": args.scenario_id,
+            "argv": sys.argv[1:],
+        },
+    )
+    print(f"run id          : {run.run_id}")
+    print(f"evidence        : {run.run_dir}")
+
+    if args.preflight_only:
+        status = run.close()
+        # The manifest is INCOMPLETE by construction — nothing was executed,
+        # and it must never look like a finished baseline. The COMMAND still
+        # exits 0 because the validation it was asked to perform succeeded;
+        # that is what makes `make eval-preflight && make eval` usable.
+        print("\npreflight-only: validation PASSED, no model calls made.")
+        print(f"run manifest status={status} (nothing executed yet)")
+        return 0
 
     from openexecutive.providers import get_provider
 
     judge_provider = get_provider(JUDGE_MODEL)
+    await _execute(kind, scenarios, judge_provider, run)
 
-    scenario_dir = Path(args.scenarios)
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    status = run.close()
+    counts = run.manifest["counts"]
+    print(
+        f"\n{status}: executed {counts['executed']}/{counts['discovered']} | "
+        f"pass {counts['passed']} | fail {counts['failed']} | error {counts['errored']}"
+    )
+    print(f"evidence: {run.run_dir}")
 
-    def _scenario_kind(s: dict) -> str:
-        if s.get("domain") == "triage":
-            return "triage"
-        if s.get("type") == "workflow":
-            return "workflow"
-        if s.get("requires_mcp"):
-            return "mcp"
-        return "chat"
+    if status != "COMPLETE":
+        return 1
+    # A COMPLETE run still fails the command when the product underperforms —
+    # distinct from the infrastructure failures above.
+    if counts["passed"] < counts["executed"] * MIN_PASS_RATE:
+        print(f"WARNING: pass rate below {MIN_PASS_RATE:.0%}")
+        return 1
+    return 0
 
-    if args.triage:
-        target_kind = "triage"
-    elif args.workflow:
-        target_kind = "workflow"
-    elif args.mcp:
-        target_kind = "mcp"
-    else:
-        target_kind = "chat"
 
-    scenarios = []
-    for yaml_file in sorted(scenario_dir.glob("*.yaml")):
-        with open(yaml_file) as f:
-            scenario = yaml.safe_load(f)
-        if args.scenario_id and scenario["id"] != args.scenario_id:
-            continue
-        if _scenario_kind(scenario) != target_kind:
-            continue
-        scenarios.append(scenario)
+async def _run_and_judge(kind, scenario, judge_provider, executive, store, out: dict):
+    """Run one scenario on its kind's path and obtain a judged verdict.
 
-    print(f"Running {len(scenarios)} eval scenarios ({target_kind})...")
+    ``out`` is filled with the run result AS SOON as the model answers, before
+    the judge is called. That ordering matters: when the judge then fails, the
+    caller still holds the response, session_id and audit trail — exactly the
+    evidence needed to diagnose the judge outage. Returning a tuple instead
+    would leave the caller with an empty stub, since the unpack never happens
+    on the raising path.
+    """
+    if kind == "triage":
+        from judges.triage_judge import judge_triage
 
-    results = []
+        out.update(await run_triage_eval(scenario))
+        return await judge_triage(scenario, out["decision"], judge_provider)
 
-    if target_kind == "triage":
-        from judges.triage_judge import judge_triage  # type: ignore[import-not-found]
+    if kind == "workflow":
+        out.update(await run_workflow_eval(scenario, store))
+        return await judge_workflow(scenario, out["artifact"], judge_provider)
 
-        for scenario in scenarios:
-            print(f"  [{scenario['id']}] {scenario['description']}")
-            try:
-                result = await run_triage_eval(scenario)
-                scores = await judge_triage(scenario, result["decision"], judge_provider)
-                result["scores"] = scores
-                result["passed"] = scores.get("overall", 0) >= 3.5
-                results.append(result)
-                status = "PASS" if result["passed"] else "FAIL"
-                print(f"    → {status} (overall: {scores.get('overall', 0):.1f}/5)")
-            except Exception as e:
-                print(f"    → ERROR: {e}")
-                results.append({"id": scenario["id"], "error": str(e), "passed": False})
-    elif target_kind == "workflow":
+    out.update(await run_eval(scenario, executive))
+    # Read back what the Executive already recorded for this session. Purely
+    # observational — see evidence.harvest_audit for what it can and cannot show.
+    out["audit"] = harvest_audit(out["session_id"])
+    return await judge_response(scenario, out["response"], judge_provider)
+
+
+
+async def _execute(kind: str, scenarios: list, judge_provider, run: RunEvidence) -> None:
+    """Run every discovered scenario, recording evidence for each.
+
+    A scenario error never aborts the run — the remaining scenarios still
+    produce evidence — but it does mark the run FAILED at close(), so a
+    partial run can never be read as a baseline.
+    """
+    import time
+    import traceback
+
+    store = None
+    executive = None
+    if kind == "workflow":
         from openexecutive.config import get_settings
         from openexecutive.knowledge.store import ChromaDBStore
 
         store = ChromaDBStore(persist_directory=get_settings().vector_store_path)
-        for scenario in scenarios:
-            print(f"  [{scenario['id']}] {scenario['description']}")
-            try:
-                result = await run_workflow_eval(scenario, store)
-                scores = await judge_workflow(scenario, result["artifact"], judge_provider)
-                result["scores"] = scores
-                result["passed"] = scores.get("overall", 0) >= 3.5
-                results.append(result)
-                status = "PASS" if result["passed"] else "FAIL"
-                print(f"    → {status} (overall: {scores.get('overall', 0):.1f}/5)")
-            except Exception as e:
-                print(f"    → ERROR: {e}")
-                results.append({"id": scenario["id"], "error": str(e), "passed": False})
-    else:
-        # "chat" (default) and "mcp" both go through the Executive.
+    elif kind in ("chat", "mcp"):
         from openexecutive.orchestrator.executive import Executive
 
         executive = Executive()
-        for scenario in scenarios:
-            print(f"  [{scenario['id']}] {scenario['description']}")
-            try:
-                result = await run_eval(scenario, executive, None)
-                scores = await judge_response(scenario, result["response"], judge_provider)
-                result["scores"] = scores
-                result["passed"] = scores.get("overall", 0) >= 3.5
-                results.append(result)
-                status = "PASS" if result["passed"] else "FAIL"
-                print(f"    → {status} (overall: {scores.get('overall', 0):.1f}/5)")
-            except Exception as e:
-                print(f"    → ERROR: {e}")
-                results.append({"id": scenario["id"], "error": str(e), "passed": False})
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"eval_results_{target_kind}_{timestamp}.json"
-    with open(output_file, "w") as f:
-        json.dump(results, f, indent=2)
+    for scenario in scenarios:
+        sid = scenario["id"]
+        print(f"  [{sid}] {scenario.get('description', '')}")
+        t0 = time.monotonic()
+        partial: dict = {"id": sid, "domain": scenario.get("domain")}
+        try:
+            verdict = await _run_and_judge(
+                kind, scenario, judge_provider, executive, store, partial
+            )
+            ms = int((time.monotonic() - t0) * 1000)
+            result = await _score(scenario, partial, verdict, ms)
+            print(f"    -> {result['outcome']} (overall {result['judge']['overall']:.1f}/5)")
 
-    passed = sum(1 for r in results if r.get("passed", False))
-    print(f"\nResults: {passed}/{len(results)} passed")
-    print(f"Output: {output_file}")
+        except JudgeError as exc:
+            ms = int((time.monotonic() - t0) * 1000)
+            result = _judge_error_result(scenario, partial, exc, ms)
+            run.add_infrastructure_error(sid, "judge_unparseable", str(exc))
+            print(f"    -> ERROR (judge): {exc}")
+        except Exception as exc:
+            ms = int((time.monotonic() - t0) * 1000)
+            result = {
+                **partial,
+                "outcome": OUTCOME_ERROR,
+                "error_kind": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+                "judge": None,
+                "duration_ms": ms,
+            }
+            run.add_infrastructure_error(sid, type(exc).__name__, str(exc))
+            print(f"    -> ERROR: {exc}")
 
-    if passed < len(results) * 0.8:
-        print("WARNING: Less than 80% of evals passed")
-        sys.exit(1)
+        try:
+            run.record(result)
+        except Exception as exc:
+            # One unwritable scenario must not deny the whole baseline. The
+            # run still closes FAILED because this is an infrastructure error.
+            run.add_infrastructure_error(sid, "evidence_write_failed", str(exc))
+            print(f"    -> ERROR (evidence write): {exc}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

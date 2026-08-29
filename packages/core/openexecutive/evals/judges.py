@@ -4,11 +4,20 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from openexecutive.providers import get_provider
-
 # The judge routes through the provider abstraction (like every other LLM call),
 # so when OPENROUTER_ENABLED is on, judging bills the OpenRouter account too.
-_JUDGE_MODEL = "claude-opus-4-7"
+from openexecutive.evals.judge_contract import (
+    JUDGE_MODEL,
+    JudgeError,
+    invoke_judge,
+)
+from openexecutive.providers import get_provider
+
+# Kept so existing importers of this module keep working, while the value has
+# exactly one definition (judge_contract).
+_JUDGE_MODEL = JUDGE_MODEL
+
+__all__ = ["JudgeError", "judge_chat", "judge_triage", "judge_workflow"]
 
 
 async def judge_chat(
@@ -35,18 +44,9 @@ Rate each dimension (1=poor, 3=acceptable, 5=excellent):
 Respond in JSON format:
 {{"persona_coherence": N, "domain_accuracy": N, "actionability": N, "topic_coverage": N, "specificity": N, "overall": N, "notes": "brief explanation"}}"""
 
-    message = await get_provider(_JUDGE_MODEL).messages_create(
-        model=_JUDGE_MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": judge_prompt}],
-    )
-    text = message.content[0].text  # type: ignore[union-attr]
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except Exception:
-        return {"overall": 0, "notes": "Failed to parse judge response"}
+    # Shared contract: an unparseable verdict raises JudgeError rather
+    # than becoming a zero score. Scoring for valid verdicts is unchanged.
+    return await invoke_judge(get_provider(JUDGE_MODEL), judge_prompt)
 
 
 async def judge_workflow(
@@ -80,18 +80,9 @@ Rate each dimension 1-5 (1=poor, 3=acceptable, 5=excellent):
 Respond in JSON:
 {{"structure": N, "specificity": N, "actionability": N, "coherence": N, "completeness": N, "overall": N, "notes": "brief"}}"""
 
-    message = await get_provider(_JUDGE_MODEL).messages_create(
-        model=_JUDGE_MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": judge_prompt}],
-    )
-    text = message.content[0].text  # type: ignore[union-attr]
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except Exception:
-        return {"overall": 0, "notes": "Failed to parse judge response"}
+    # Shared contract: an unparseable verdict raises JudgeError rather
+    # than becoming a zero score. Scoring for valid verdicts is unchanged.
+    return await invoke_judge(get_provider(JUDGE_MODEL), judge_prompt)
 
 
 async def judge_triage(
@@ -159,15 +150,6 @@ ACTUAL DECISION:
 Respond in JSON:
 {{"severity_accuracy": N, "channel_appropriateness": N, "dedup_correctness": N, "overall": N, "notes": "brief"}}"""
 
-    message = await get_provider(_JUDGE_MODEL).messages_create(
-        model=_JUDGE_MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": judge_prompt}],
-    )
-    text = message.content[0].text  # type: ignore[union-attr]
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        return json.loads(text[start:end])
-    except Exception:
-        return {"overall": 0, "notes": "Failed to parse triage judge response"}
+    # Shared contract: an unparseable verdict raises JudgeError rather
+    # than becoming a zero score. Scoring for valid verdicts is unchanged.
+    return await invoke_judge(get_provider(JUDGE_MODEL), judge_prompt)

@@ -19,10 +19,19 @@ test:
 lint:
 	cd packages/core && uv run ruff check openexecutive/ && uv run mypy openexecutive/
 
+# No --scenarios: the packaged loader (openexecutive/evals/scenarios.py) is the
+# single source of discovery and resolves the directory itself. The old flag
+# pointed at evals/scenarios/, which has not existed for some time — the runner
+# then found 0 scenarios and still exited 0.
 eval:
 	cd packages/core && uv run python ../../evals/run_evals.py \
-		--scenarios ../../evals/scenarios/ \
 		--output ../../evals/results/
+
+# Validate inventory + knowledge store and write a run manifest without making
+# a single model call. Run this before spending money on a baseline.
+eval-preflight:
+	cd packages/core && uv run python ../../evals/run_evals.py \
+		--output ../../evals/results/ --preflight-only
 
 docker:
 	docker compose -f docker/docker-compose.yml up --build
