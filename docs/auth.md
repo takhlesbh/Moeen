@@ -53,26 +53,49 @@ See [`_UNAUTHENTICATED_PATHS`](../packages/core/openexecutive/api/main.py) — a
    - **Authorized redirect URIs**: `http://localhost:3000/api/auth/callback/google`, `https://openexec-ui-dev.fly.dev/api/auth/callback/google`
 4. Copy the Client ID and Client secret immediately — the secret is shown only once.
 
-### Local dev (`packages/ui/.env.local`, gitignored)
+### Local dev (repo-root `.env`, gitignored)
+
+Put everything in the repo-root `.env` (the file the README quickstart has you
+create from `.env.example`). Both `make dev` and `make docker` load it into the
+API **and** the UI:
+
+Generate the two random secrets first and paste their **output** — never put
+`$(...)` inside the file itself: the file is parsed as plain text by Docker
+Compose and the backend's dotenv loader, so command substitutions become the
+literal (publicly known) string instead of a secret.
+
+```bash
+openssl rand -base64 32   # → paste as AUTH_SECRET
+openssl rand -hex 32      # → paste as BACKEND_SHARED_SECRET
+```
 
 ```bash
 AUTH_GOOGLE_ID=<from google>
 AUTH_GOOGLE_SECRET=<from google>
-AUTH_SECRET=$(openssl rand -base64 32)
+AUTH_SECRET=<paste the base64 output>
 AUTH_TRUST_HOST=true
+# AUTH_URL stays blank for local dev — set it only on public deployments.
 ALLOWED_EMAILS=you@example.com,teammate@example.com
-BACKEND_BASE_URL=http://localhost:8000
-BACKEND_SHARED_SECRET=$(openssl rand -hex 32)
-```
-
-And in `packages/core/.env` (also gitignored):
-
-```bash
+BACKEND_SHARED_SECRET=<paste the hex output>
 ANTHROPIC_API_KEY=sk-ant-...
-BACKEND_SHARED_SECRET=<same value as in packages/ui/.env.local>
 ```
 
 Then `make dev` and visit http://localhost:3000.
+
+For Docker, use `make docker` (not a bare `docker compose -f
+docker/docker-compose.yml up`): the Makefile passes `--env-file .env`, which
+is what feeds the UI container's `AUTH_*` / `BACKEND_SHARED_SECRET` values.
+If you invoke compose directly, add `--env-file .env` yourself.
+
+A `packages/ui/.env.local` (also gitignored) still works, but note the
+precedence: under `make dev` / `make docker` the root `.env` is exported into
+the process environment before Next.js starts, and Next never overrides an
+already-set variable — so **for any key present in both files, the root `.env`
+wins — including keys left blank in the root file** (a blank export still
+counts as set). Use `.env.local` only for keys absent from the root `.env`
+entirely.
+Plain `npm run dev` in `packages/ui` (without `make dev`) reads only
+`packages/ui/.env*`, not the root `.env`.
 
 ### Production (Fly secrets)
 
@@ -139,7 +162,7 @@ flyctl secrets set -a openexec-ui-dev AUTH_SECRET="$(openssl rand -base64 32)"
 
 ### Revoke OAuth client
 
-If `AUTH_GOOGLE_SECRET` is leaked, regenerate in Google Cloud Console (Clients → your client → **Reset Secret**), then update both your local `.env.local` and the Fly secret. Old issued tokens stop working immediately.
+If `AUTH_GOOGLE_SECRET` is leaked, regenerate in Google Cloud Console (Clients → your client → **Reset Secret**), then update both your local root `.env` (and `packages/ui/.env.local` if you use one) and the Fly secret. Old issued tokens stop working immediately.
 
 ---
 

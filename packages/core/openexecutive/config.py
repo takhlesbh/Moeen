@@ -22,11 +22,27 @@ if not _FOUND_ENV:
 _ENV_FILE = _ROOT / ".env"
 
 
+def _blank_or_comment(v: Any) -> bool:
+    """True for unset, '', or a dotenv inline-comment captured as the value.
+
+    Optional keys are often left as `KEY=`. `make dev` exports those as
+    empty strings; an inline `# comment` on the same line can instead be
+    parsed as the value. Both must map to "unset".
+    """
+    return v is None or (
+        isinstance(v, str) and (not v.strip() or v.strip().startswith("#"))
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
+        # .env.example (and copies of it) leave optional keys as `KEY=`.
+        # `make dev` exports those as empty strings; without this flag an
+        # optional int like DISCORD_NOTIFY_CHANNEL_ID crashes startup.
+        env_ignore_empty=True,
     )
 
     # Optional: a deployment can run entirely on local / OpenRouter models
@@ -172,7 +188,7 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _blank_local_default_is_unset(cls, v: Any) -> Any:
-        """Treat a blank value as "operator did not configure this".
+        """Treat a blank or comment-only value as "operator did not configure this".
 
         ``.env.example`` ships these keys present-but-empty, which is this
         file's convention for an optional setting, and a blank env var / Fly
@@ -185,8 +201,16 @@ class Settings(BaseSettings):
         blank string is not None, so it survived every ``is not None`` guard on
         the path and shipped ``reasoning_effort: ""`` — an out-of-enum value —
         on every local request.
+
+        Shares ``_blank_or_comment`` with the Discord validators rather than
+        re-deciding what "blank" means: that also covers a dotenv inline
+        ``# comment`` captured as the value, which this validator previously
+        passed through to a float parse error. ``env_ignore_empty=True`` on
+        ``model_config`` already drops empty values arriving from env/dotenv,
+        but not values passed directly to ``Settings(...)``, and it does not
+        trim surrounding whitespace — both of which this still handles.
         """
-        if isinstance(v, str) and not v.strip():
+        if _blank_or_comment(v):
             return None
         if isinstance(v, str):
             return v.strip()
@@ -328,6 +352,13 @@ class Settings(BaseSettings):
         True, alias="DISCORD_THREAD_RESPONSE_GATE_ENABLED"
     )
 
+    @field_validator("discord_notify_channel_id", mode="before")
+    @classmethod
+    def _parse_notify_channel_id(cls, v: Any) -> Any:
+        if _blank_or_comment(v):
+            return None
+        return v
+
     # @mention auto-thread router. The default mode promotes nearly every
     # plain-channel @mention into a fresh auto-titled thread (with a
     # one-line pointer left behind in the channel) — except when the
@@ -361,7 +392,9 @@ class Settings(BaseSettings):
             return [int(x) for x in v]
         if isinstance(v, (int, float)):
             return [int(v)]
-        if isinstance(v, str) and v.strip():
+        if _blank_or_comment(v):
+            return []
+        if isinstance(v, str):
             return [int(x.strip()) for x in v.split(",") if x.strip()]
         return []
 

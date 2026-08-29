@@ -108,10 +108,18 @@ cd OpenExecutive
 # Set your Anthropic API key
 cp .env.example .env
 # Edit .env and add ANTHROPIC_API_KEY=sk-ant-...
+# For the web UI's Google sign-in, also fill in the AUTH_* block
+# (see docs/auth.md for the Google Cloud Console steps).
 
 # Start everything
 make dev
 ```
+
+All configuration lives in that repo-root `.env` — `make dev` and `make docker`
+both load it for the API *and* the UI (Auth.js needs `AUTH_SECRET` /
+`AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` at runtime). A
+`packages/ui/.env.local` is also read for UI-only keys, but for keys present
+in both files the root `.env` takes precedence.
 
 Open http://localhost:3000 to start chatting with your executive. The API runs on port 8000 and the UI on 3000.
 

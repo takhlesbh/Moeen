@@ -24,6 +24,10 @@ All PRs must:
 3. Include tests for new behavior
 4. For new or modified agents: include at least 2 eval scenarios
 5. **Architecture docs**: verify `/architecture` reflects your change (see below)
+6. **A completed PR description using the template** — what changed, why, and
+   how it works, with the checklist filled in. PRs submitted with an empty
+   template will be closed; you're welcome to resubmit with the sections
+   completed.
 
 ## Adding a New Specialist Agent
 
@@ -41,21 +45,36 @@ Requirements:
 
 ## Architecture Docs (`/architecture` page)
 
-The `/architecture` page in the UI documents the system for the team. Parts of it are live (auto-pulled from the API) and parts are static diagrams.
+The `/architecture` page in the UI is served from **static, hand-authored
+content**: one `packages/core/openexecutive/architecture/prebuilt/<section_id>.json`
+file per section listed in `architecture/sections.py`. Nothing on that path
+calls an LLM at runtime, so nothing updates itself — if your PR changes
+behavior a section describes and you don't re-author the section, the page
+silently goes stale.
 
-**You do NOT need to update anything if you:**
-- Add a new specialist agent (the Agent Council section pulls from `GET /agents` automatically)
-- Add or change an API endpoint (the API Reference pulls from `GET /openapi.json` automatically)
-- Add or change a workflow (the Workflows section pulls from `GET /workflows` automatically)
+The deep source-of-truth notes behind the page live in
+`packages/core/openexecutive/architecture/architecture-facts.yaml`.
 
-**You DO need to update the static diagrams in `packages/ui/src/app/architecture/page.tsx` if you:**
-- Change the overall request flow (how requests move from client → API → Executive → specialists → response)
-- Change the prompt caching strategy (how system blocks are built or what's in the user turn)
-- Add a new integration layer (new inbound channel, new external service)
-- Change the memory system architecture (new storage backend, new extraction pipeline)
-- Change how the knowledge/RAG pipeline works at a structural level
+**When your PR materially changes a documented topic, update BOTH in the same
+PR**: the relevant `architecture-facts.yaml` key, and the affected
+`prebuilt/<section_id>.json`. This applies equally to *changes* under an
+existing topic (e.g. adding a new integration channel, changing a documented
+endpoint's response shape) — not just brand-new topics. The topic → section-id
+map and full procedure are in [CLAUDE.md](../CLAUDE.md#architecture-docs);
+common cases:
 
-These structural changes are rare and significant — they warrant a diagram update in the same PR.
+- New or changed integration channel → `integrations`
+- New workflow primitive or routing pattern → `workflows` / `agents` / `lifecycle`
+- Cache layout change → `caching`
+- Endpoint added/removed/renamed or response shape changed → `api`
+- New top-level module under `packages/core/openexecutive/` → new `SectionSpec`
+  in `architecture/sections.py`, matching entry in
+  `packages/ui/src/app/architecture/page.tsx`, and a new `prebuilt/<id>.json`
+
+Each `prebuilt/<id>.json` carries `section_id`, `title`, `markdown`, `mermaid`
+(string or `null`), and `generated_at`; validate edits with
+`python -m json.tool`. Pure additions to `SPECIALIST_REGISTRY` are
+auto-reflected in the `agents` facts and need no YAML edit.
 
 ## Prompt Changes
 

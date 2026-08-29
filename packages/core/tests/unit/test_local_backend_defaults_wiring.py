@@ -197,6 +197,28 @@ def test_whitespace_is_trimmed_not_forwarded(monkeypatch: pytest.MonkeyPatch) ->
     assert provider._default_params == {"reasoning_effort": "none"}
 
 
+def test_dotenv_inline_comment_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dotenv inline comment captured as the value must mean "unset".
+
+    `KEY=   # note` can be parsed with the comment as the value. The float
+    fields would then fail to parse at boot and the string field would ship the
+    comment text to the backend. The LOCAL_* validator shares
+    ``_blank_or_comment`` with the Discord validators so one definition of
+    "blank" covers both.
+    """
+    from openexecutive.config import Settings
+
+    _local_env(
+        monkeypatch,
+        LOCAL_TEMPERATURE="# leave unset for now",
+        LOCAL_REASONING_EFFORT="  # none, but disabled",
+    )
+    settings = Settings()  # type: ignore[call-arg]
+    assert settings.local_temperature is None
+    assert settings.local_reasoning_effort is None
+    assert registry.get_provider("qwen3.5:latest")._default_params == {}
+
+
 def test_out_of_range_top_p_is_rejected_at_boot(monkeypatch: pytest.MonkeyPatch) -> None:
     """top_p is probability mass — outside [0, 1] is a typo, not a preference.
 
