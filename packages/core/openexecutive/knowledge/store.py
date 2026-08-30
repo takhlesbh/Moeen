@@ -22,7 +22,15 @@ class KnowledgeStore(ABC):
         collection: str,
         domain_filter: list[str] | None = None,
         n_results: int = 5,
-    ) -> list[dict[str, Any]]: ...
+    ) -> list[dict[str, Any]]:
+        """Rows of ``{"id", "text", "metadata", "distance"}``, nearest first.
+
+        ``id`` is the store's own record id. It is **descriptive metadata
+        only** — see :class:`ChromaDBStore.query` for why it must never be
+        used to authorise a provenance claim. Implementations that cannot
+        supply one may omit the key; every consumer reads it with ``.get``.
+        """
+        ...
 
     @abstractmethod
     def collection_exists(self, collection: str) -> bool: ...
@@ -105,15 +113,40 @@ class ChromaDBStore(KnowledgeStore):
 
         results = col.query(**query_kwargs)
 
+        # Chroma always returns `ids` — it is not an `include` option, and asking
+        # for it raises. Carry it through as DESCRIPTIVE metadata so a caller can
+        # say *which stored record* a chunk came from.
+        #
+        # It must NEVER become provenance authority. The id is
+        # `md5(f"{source_path}::chunk::{i}")` (knowledge/loader.py), which is
+        # global and persistent: it stays valid across invocations, so a model
+        # replaying one from an earlier consultation would pass any check made
+        # against it. Invocation-scoped authority is minted separately by
+        # `knowledge/retriever.retrieve_structured`.
+        raw_ids = results.get("ids") or []
+        ids: list[Any] = list(raw_ids[0]) if raw_ids and raw_ids[0] else []
+
         output = []
         if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-                strict=False,
+            for idx, (doc, meta, dist) in enumerate(
+                zip(
+                    results["documents"][0],
+                    results["metadatas"][0],
+                    results["distances"][0],
+                    strict=False,
+                )
             ):
-                output.append({"text": doc, "metadata": meta, "distance": dist})
+                # Positional pairing, guarded: Chroma returns these as parallel
+                # arrays, but a short/absent `ids` must degrade to None rather
+                # than IndexError or — far worse — silently pairing a chunk with
+                # another chunk's id.
+                row: dict[str, Any] = {
+                    "id": ids[idx] if idx < len(ids) else None,
+                    "text": doc,
+                    "metadata": meta,
+                    "distance": dist,
+                }
+                output.append(row)
         return output
 
     def collection_exists(self, collection: str) -> bool:

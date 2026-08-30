@@ -262,7 +262,18 @@ routing:
     Executive can re-ask on a later turn. The `routing_decision` debug event
     carries requested_count / cap / dispatched_count / skipped_count so the
     fan-out width is observable per turn.
-  retrieval_per_call: Each parallel tool call runs its own domain-filtered ChromaDB query before the specialist sees the question.
+  retrieval_per_call: |
+    Each parallel tool call runs its own domain-filtered ChromaDB query before
+    the specialist sees the question. Agents declaring
+    `accepts_retrieval_set = True` (CFO only today) take the structured path:
+    `router._retrieve_for_call` calls `retrieve_structured`, and the resulting
+    `RetrievalSet` is forwarded via the keyword-only `retrieval_set` argument on
+    `route_to_specialist`, indexed to the same call it was minted from. Every
+    other agent gets the legacy string and no set — `BaseAgent.analyze` is
+    unchanged. A caller-supplied `retrieved_knowledge_map` short-circuits
+    retrieval, so it deliberately yields NO set: that text carries no tokens and
+    must authorise nothing. See `knowledge.retrieval_provenance` for the trust
+    rule.
   committee_review: |
     Optional 3-phase response synthesis exposed via
     Executive.stream_chat_with_committee():
@@ -522,6 +533,76 @@ knowledge:
         BELOW the curated company-documents section.
   domain_aliases_source: openexecutive.knowledge.retriever.DOMAIN_ALIASES
   dedupe_note: Multi-domain chunks can fan out to multiple rows; the retriever dedupes by text before returning.
+  retrieval_provenance: |
+    Two retrieval entry points share ONE pipeline (`_gather` does all querying,
+    filtering, threshold-gating, dedup, priority sort and top-K; `_render`
+    formats):
+
+      - `retrieve() -> str` — the legacy path, used by ~57 call expressions
+        across ~40 modules (workflows, chat, the 5 chat integrations, scheduler,
+        MCP, CLI, evals). Its output is byte-identical to what it produced
+        before provenance existed, pinned by a golden test.
+      - `retrieve_structured() -> (str, RetrievalSet)` — mints a fresh opaque
+        `retrieval_id` (`secrets.token_urlsafe`) for EVERY retained chunk, tags
+        it into the model-visible text as `[ref:<token>]`, and returns the set.
+
+    Trust rule — the ONLY provenance authority in the system:
+
+        ref.retrieval_id ∈ retrieval_set(this specialist invocation)
+
+    Everything else is explicitly NOT authority. `filename`/`label` are
+    model-asserted display text (and are not even reliable labels — see
+    `known_defects` below). `page`/`sheet`/`cell_range`/`url`/`retrieved_at`
+    are stripped from model output entirely. The persistent Chroma record id is
+    carried through `KnowledgeStore.query` rows as descriptive `chunk_id` only:
+    it is global and stable, so a replayed one would still "exist" and cannot
+    gate anything.
+
+    Properties the design depends on:
+      - tokens are minted AFTER filtering, so a deduped / threshold-dropped /
+        review-rejected / past-top-K row never receives one;
+      - the same underlying chunk retrieved twice gets two different tokens, so
+        replay across invocations is detected rather than merely improbable;
+      - the token encodes nothing (no filename, collection, ordinal, document
+        identity, call sequence, timestamp) — anything derivable from it would
+        be provenance a model could forge by construction;
+      - SME annotations get no token: they are not retrieved chunks and cannot
+        establish retrieval provenance;
+      - `RetrievalSet` is frozen and passed as an argument, never stored on the
+        shared `SPECIALIST_REGISTRY` agent instance.
+
+    Validation lives in `specialists.result_contract.parse_specialist_result`
+    via `allowed_retrieval_ids`. Unknown, replayed, or non-string tokens are
+    stripped and reported as a COUNT (never the token text — the reason string
+    is logged, persisted and UI-surfaced). No set supplied ⇒ every
+    `retrieval_id` is stripped; "the model wrote a token" is never sufficient.
+
+    WHAT THE TOKEN DOES NOT PROVE — read this before consuming `claims`:
+    a validated `retrieval_id` establishes "this passage was supplied to this
+    call". It does NOT establish "this claim was derived from this passage".
+    Every chunk co-retrieved in one invocation carries an equally valid token,
+    so a model (or a hostile chunk instructing one) can attach a legitimate
+    document's token to a fabricated figure, and the claim emerges with
+    confirmed provenance pointing at an innocent source. Distinguishing
+    membership from derivation needs a separate mechanism (quote-matching, an
+    Evidence Gate) that this slice does not ship. Also note nothing persists a
+    token→chunk map: the retrieval audit row is emitted before minting and
+    carries no tokens, so a validated reference cannot be traced back to its
+    passage once the call ends.
+
+    Scope today: CFO only, and claims are still NOT exposed to the Executive —
+    the specialist boundary remains `str`.
+  known_defects: |
+    Company documents uploaded via `POST /documents` (and via Slack/Discord
+    attachment ingest) are chunked from a NamedTemporaryFile, so their
+    `filename`/`source` metadata records the temp name (e.g. `tmprbtpv1gu.pdf`),
+    not the uploaded name. Consequences: the model sees the temp name as the
+    source label; `DELETE /documents/{filename}` deletes by the real name and
+    therefore never matches those chunks (orphans accumulate); and chunk ids,
+    being `md5(f"{path}::chunk::{i}")` over that temp path, are unstable across
+    re-upload. This is why retrieval provenance is keyed on invocation-scoped
+    tokens rather than on filenames. Fixing ingestion identity is tracked as a
+    separate follow-up slice.
 
 memory:
   episodic_db: ./episodic_memory.db

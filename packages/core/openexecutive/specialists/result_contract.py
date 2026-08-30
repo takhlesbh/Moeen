@@ -165,13 +165,29 @@ class EvidenceRef(_ContractModel):
     are what the specialist says it saw, not something this module verified. The
     structured fields below are stripped from model output entirely; these two
     cannot be, because they are the only handle a human has for tracing a claim.
-    Cross-checking them against the chunk set actually retrieved needs the
-    retrieval result in scope, which arrives with the wiring slice.
+
+    ``retrieval_id`` is the one field that carries actual authority, and it is
+    the only model-writable field that does. It survives parsing only when it
+    appears in the retrieval set supplied to *that* specialist invocation (see
+    ``allowed_retrieval_ids`` on :func:`parse_specialist_result`). A present
+    ``retrieval_id`` therefore means "the application confirmed this passage was
+    retrieved for this call"; ``None`` means no retrieval provenance was
+    established, whatever ``label`` and ``filename`` happen to say.
+
+    The distinction matters because ``label`` and ``filename`` are guessable and
+    non-unique — the upload path currently stores temp-file names, so two
+    different documents can share one — while a token cannot be guessed and
+    cannot be carried over from an earlier call.
     """
 
     kind: EvidenceKind
     # What the specialist reports having seen, e.g. "[Q3-board-deck.pdf]".
     label: str
+
+    # --- the only verified provenance handle -----------------------------
+    # Model-copied, then checked against the current invocation's retrieval set.
+    # Anything unrecognised is stripped before this model is constructed.
+    retrieval_id: str | None = None
 
     # --- supplied by the retrieval layer today ---------------------------
     filename: str | None = None
@@ -507,6 +523,19 @@ EMIT_SPECIALIST_RESULT_TOOL: dict[str, Any] = {
                                             "appeared to you."
                                         ),
                                     },
+                                    "retrieval_id": {
+                                        "type": "string",
+                                        "description": (
+                                            "The opaque token shown as "
+                                            "[ref:<token>] beside the passage "
+                                            "you used, copied verbatim. Valid "
+                                            "only for this request. Omit it if "
+                                            "you did not use a tagged passage "
+                                            "— an invented, altered, or reused "
+                                            "token is discarded and leaves the "
+                                            "claim with no source."
+                                        ),
+                                    },
                                 },
                                 "required": ["kind", "label"],
                             },
@@ -706,13 +735,32 @@ def _tool_payloads(blocks: list[Any]) -> tuple[list[dict[str, Any]], list[str]]:
     return payloads, problems
 
 
-def _scrub_evidence(raw: Any) -> tuple[list[dict[str, Any]], list[str]]:
+def _scrub_evidence(
+    raw: Any, allowed_retrieval_ids: frozenset[str] | None = None
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Build evidence dicts, dropping provenance the model cannot know.
 
     Also reports what was lost. ``_scrub_evidence`` returning an empty list for
     a malformed input would otherwise be indistinguishable from "this claim had
     no evidence" — which would let a claim marked ``independent_evidence`` reach
     the Executive with zero refs and no sign that any were dropped.
+
+    ``allowed_retrieval_ids`` is the retrieval set for THIS invocation:
+
+    * ``None`` — no set was supplied, so nothing can be verified and every
+      ``retrieval_id`` is stripped. This is the safe reading, not a lenient one:
+      passing a token through unchecked would make "the model wrote a token"
+      sufficient to look like provenance, which is precisely the property this
+      field exists to deny. It also keeps every caller that predates the
+      structured path behaving exactly as it does today.
+    * a set — a token is kept iff it is a member. Non-members cover the
+      fabricated token, the token for a chunk not supplied to this call, and the
+      token replayed from an earlier call; all three are indistinguishable from
+      one another and are treated identically, which is what makes the check
+      total rather than a list of special cases.
+
+    A stripped token NEVER promotes ``filename``/``label`` to provenance. Those
+    stay exactly what they were: model-asserted display text.
     """
     problems: list[str] = []
     if raw is None:
@@ -723,15 +771,38 @@ def _scrub_evidence(raw: Any) -> tuple[list[dict[str, Any]], list[str]]:
     out: list[dict[str, Any]] = []
     dropped = 0
     invented: set[str] = set()
+    unverifiable_refs = 0
     for item in raw:
         if not isinstance(item, dict):
             dropped += 1
             continue
         invented.update(k for k in item if k in _MODEL_FORBIDDEN_EVIDENCE_FIELDS)
-        out.append({
+        entry = {
             k: v for k, v in item.items()
             if k not in _MODEL_FORBIDDEN_EVIDENCE_FIELDS
-        })
+        }
+        if "retrieval_id" in entry:
+            token = entry.pop("retrieval_id")
+            # An explicit null is the JSON encoding of "I used no tagged
+            # passage" — exactly what the tool description tells the model to do
+            # when it has no token. Counting it as a rejected reference would
+            # mark a compliant model as an attacker, degrade the result, and
+            # make `degraded_reason` unable to distinguish the two.
+            if token is None:
+                pass
+            # A non-str is as unverifiable as a wrong str — checking membership
+            # first would let an unhashable type (list/dict) raise inside the
+            # parser, turning hostile output into an exception instead of a
+            # degradation.
+            elif (
+                not isinstance(token, str)
+                or allowed_retrieval_ids is None
+                or token not in allowed_retrieval_ids
+            ):
+                unverifiable_refs += 1
+            else:
+                entry["retrieval_id"] = token
+        out.append(entry)
     if dropped:
         problems.append(f"{dropped} evidence entr(y/ies) were not objects")
     if invented:
@@ -740,6 +811,16 @@ def _scrub_evidence(raw: Any) -> tuple[list[dict[str, Any]], list[str]]:
         # only a signal makes the behaviour visible in production.
         problems.append(
             "discarded model-asserted provenance: " + ", ".join(sorted(invented))
+        )
+    if unverifiable_refs:
+        # The COUNT, never the token — same rule the unknown-payload-key branch
+        # follows. A rejected token is model-authored text of unbounded length
+        # and arbitrary content, and this string is logged, persisted into the
+        # degraded reason, and surfaced in the UI. Echoing it would hand a
+        # document able to influence model output a direct write into all three.
+        problems.append(
+            f"{unverifiable_refs} evidence reference(s) not in this call's "
+            "retrieval set; discarded"
         )
     return out, problems
 
@@ -903,12 +984,19 @@ def parse_specialist_result(
     *,
     specialist: str,
     model: str = "",
+    allowed_retrieval_ids: frozenset[str] | None = None,
 ) -> SpecialistResult:
     """Turn a provider message into a :class:`SpecialistResult`.
 
     Never raises for bad model output. A specialist that returns something
     unexpected must not take down the Executive's tool loop, so every failure
     path degrades to prose plus an explicit reason.
+
+    ``allowed_retrieval_ids`` is the set of provenance tokens minted for this
+    exact invocation (``knowledge.retriever.RetrievalSet.allowed_ids``). Omit it
+    and every ``retrieval_id`` is stripped — the pre-existing behaviour, and the
+    correct one, since without a set there is nothing to verify against. See
+    :func:`_scrub_evidence` for the full rule.
 
     Degrades when the tool block is missing (the expected case on backends that
     silently drop ``tool_choice``), when its payload is unusable, when
@@ -1003,7 +1091,9 @@ def parse_specialist_result(
                     k: v for k, v in item.items()
                     if k not in ("evidence", "calculation")
                 }
-                evidence, evidence_problems = _scrub_evidence(item.get("evidence"))
+                evidence, evidence_problems = _scrub_evidence(
+                    item.get("evidence"), allowed_retrieval_ids
+                )
                 problems.extend(evidence_problems)
                 claim["evidence"] = evidence
                 calculation, calculation_problems = _scrub_calculation(

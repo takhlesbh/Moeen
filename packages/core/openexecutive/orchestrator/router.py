@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from openexecutive.agents.base import BaseAgent
 
 if TYPE_CHECKING:
+    from openexecutive.knowledge.retriever import RetrievalSet
     from openexecutive.orchestrator.debug_events import DebugCollector
 from openexecutive.agents.board_comms import BoardCommsAgent
 from openexecutive.agents.finance import FinanceAgent
@@ -76,6 +77,17 @@ SPECIALIST_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+def _accepts_retrieval_set(agent: BaseAgent) -> bool:
+    """Whether ``agent`` can validate evidence against a retrieval set.
+
+    A class-attribute capability flag rather than an isinstance check, matching
+    how the rest of the agent layer varies behaviour (``use_deep_reasoning``).
+    That keeps this function free of any specific agent import, so the second
+    specialist to opt in changes nothing here.
+    """
+    return bool(getattr(agent, "accepts_retrieval_set", False))
+
+
 async def route_to_specialist(
     specialist_name: str,
     query: str,
@@ -84,10 +96,28 @@ async def route_to_specialist(
     episodic_context: str = "",
     failure_cases: str = "",
     department_memory: str = "",
+    *,
+    retrieval_set: RetrievalSet | None = None,
 ) -> str:
+    """Dispatch one specialist call. Returns prose, as it always has.
+
+    ``retrieval_set`` is keyword-only and defaults to ``None``, so the ~30
+    workflow modules and the MCP tool that call this positionally are untouched.
+    It is forwarded ONLY to agents that declare they can verify against it; for
+    every other agent it is dropped here, because ``BaseAgent.analyze`` has no
+    such parameter and gains none in this slice.
+
+    The set is passed as an argument and never stored. ``SPECIALIST_REGISTRY``
+    holds one shared instance per specialist, so parking it on the agent would
+    let two concurrent turns validate against each other's retrieval — the exact
+    cross-invocation confusion the token design exists to prevent.
+    """
     agent = SPECIALIST_REGISTRY.get(specialist_name)
     if agent is None:
         return f"Unknown specialist: {specialist_name}"
+    kwargs: dict[str, Any] = {}
+    if retrieval_set is not None and _accepts_retrieval_set(agent):
+        kwargs["retrieval_set"] = retrieval_set
     return await agent.analyze(
         query=query,
         context=context,
@@ -95,6 +125,7 @@ async def route_to_specialist(
         episodic_context=episodic_context,
         failure_cases=failure_cases,
         department_memory=department_memory,
+        **kwargs,
     )
 
 
@@ -146,13 +177,29 @@ def partition_specialist_fanout(
     return run_tool_uses, run_calls, skipped_results, cap
 
 
-async def _retrieve_for_call(call: dict[str, str]) -> str:
-    """Run a per-specialist, domain-filtered vector retrieval for one tool call."""
-    from openexecutive.knowledge.retriever import retrieve
+async def _retrieve_for_call(
+    call: dict[str, str],
+) -> tuple[str, RetrievalSet | None]:
+    """Run a per-specialist, domain-filtered vector retrieval for one tool call.
 
-    return await asyncio.to_thread(
+    Specialists that can verify evidence take the structured path, which mints a
+    fresh provenance token per retained chunk and tags it into the context the
+    model reads. Everyone else takes the legacy path and gets the byte-identical
+    string they get today — no token, and no set to validate against.
+    """
+    from openexecutive.knowledge.retriever import retrieve, retrieve_structured
+
+    agent = SPECIALIST_REGISTRY.get(call["specialist"])
+    if agent is not None and _accepts_retrieval_set(agent):
+        return await asyncio.to_thread(
+            retrieve_structured,
+            query=call["query"],
+            specialist_name=call["specialist"],
+        )
+    text = await asyncio.to_thread(
         retrieve, query=call["query"], specialist_name=call["specialist"]
     )
+    return text, None
 
 
 async def _retrieve_failures_for_call(call: dict[str, str]) -> str:
@@ -216,18 +263,28 @@ async def route_parallel(
     Returns results in the same order as ``calls`` so callers can zip
     with tool_use_ids.
     """
+    retrieval_sets: list[RetrievalSet | None]
     if retrieved_knowledge_map is None:
-        knowledge_futures = [_retrieve_for_call(c) for c in calls]
-        failures_futures = [_retrieve_failures_for_call(c) for c in calls]
-        all_results = await asyncio.gather(*knowledge_futures, *failures_futures)
-        mid = len(calls)
-        knowledge_per_call = list(all_results[:mid])
-        failures_per_call = list(all_results[mid:])
+        # Two nested gathers rather than one flat gather sliced at `mid`:
+        # knowledge calls now return (text, set) pairs and failures return
+        # plain strings, so a flat list would be heterogeneous and an
+        # off-by-one in the slice would pair a specialist with another's
+        # retrieval set. Both fan-outs still start together and run
+        # concurrently — the outer gather is what preserves that.
+        knowledge_pairs, failures_per_call = await asyncio.gather(
+            asyncio.gather(*(_retrieve_for_call(c) for c in calls)),
+            asyncio.gather(*(_retrieve_failures_for_call(c) for c in calls)),
+        )
+        knowledge_per_call = [text for text, _ in knowledge_pairs]
+        retrieval_sets = [rset for _, rset in knowledge_pairs]
     else:
         knowledge_per_call = [
             retrieved_knowledge_map.get(c["specialist"], "") for c in calls
         ]
         failures_per_call = [""] * len(calls)
+        # A caller-supplied map is plain text with no tokens in it. Handing a
+        # set here would authorise references to chunks this call never saw.
+        retrieval_sets = [None] * len(calls)
 
     # Fan out dept-memory prefetch alongside knowledge/failures. Each call
     # is cheap when Honcho is disabled or when the specialist has no
@@ -258,6 +315,9 @@ async def route_parallel(
             episodic_context=episodic_context,
             failure_cases=failures_per_call[idx],
             department_memory=dept_memory_per_call[idx],
+            # Indexed by the same `idx` as the knowledge it was minted from, so
+            # a specialist can only ever validate against its own retrieval.
+            retrieval_set=retrieval_sets[idx],
         )
         if debug_collector:
             debug_collector.emit("specialist_done", {

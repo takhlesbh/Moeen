@@ -15,10 +15,13 @@ structured path either yields claims or costs nothing.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openexecutive.agents.base import BaseAgent
 from openexecutive.config import get_settings
+
+if TYPE_CHECKING:
+    from openexecutive.knowledge.retriever import RetrievalSet
 from openexecutive.specialists.result_contract import (
     SpecialistResult,
     emit_specialist_result_tool,
@@ -43,6 +46,12 @@ class FinanceAgent(BaseAgent):
     name = "cfo"
     domain = "finance"
     use_deep_reasoning = True
+
+    # Capability flag read by ``orchestrator.router``. Declaring it opts this
+    # agent into the structured retrieval path — it receives context tagged with
+    # per-invocation provenance tokens and a set to validate them against.
+    # Agents that do not declare it keep the legacy string path unchanged.
+    accepts_retrieval_set = True
 
     @property
     def model(self) -> str:  # type: ignore[override]
@@ -69,13 +78,25 @@ class FinanceAgent(BaseAgent):
         system_prompt_override: str | None = None,
         model_override: str | None = None,
         deep_reasoning_override: bool | None = None,
+        retrieval_set: RetrievalSet | None = None,
     ) -> str:
         """Run CFO's analysis structurally, returning the legacy string.
 
-        Signature and return type match ``BaseAgent.analyze`` exactly, because
+        Return type matches ``BaseAgent.analyze`` exactly, because
         ``route_to_specialist`` (``orchestrator/router.py``) and the Council
         sandbox (``api/routes/agents.py``) call it positionally and by keyword
-        and both expect a ``str``.
+        and both expect a ``str``. ``retrieval_set`` is an additive keyword-only
+        parameter the base class does not have; the router only passes it to
+        agents that declare ``accepts_retrieval_set``, so no other caller is
+        affected and CFO still works when it is omitted.
+
+        ``retrieval_set`` is the provenance authority for this one call. It is
+        read into a local, used to validate the model's evidence references, and
+        then dropped. It is deliberately NOT stored on ``self``: this class is
+        instantiated once in ``SPECIALIST_REGISTRY`` and shared across every
+        concurrent turn, so an instance attribute would let one turn's CFO call
+        validate against another turn's retrieval — a cross-request provenance
+        forgery that needs no hostile model to trigger, just two users at once.
 
         The structured result is parsed and kept for the duration of the call —
         :attr:`last_result` — but only its narrative crosses the boundary. The
@@ -129,8 +150,15 @@ class FinanceAgent(BaseAgent):
         resolved_model = (
             model_override if model_override is not None else self.effective_model()
         )
+        # Local, per-invocation. `None` when no set was supplied (workflows, the
+        # MCP tool, the CLI, every caller that predates this path), which makes
+        # the parser strip every retrieval_id — no set, no provenance.
+        allowed_ids = retrieval_set.allowed_ids() if retrieval_set is not None else None
         result = parse_specialist_result(
-            message, specialist=self.name, model=resolved_model
+            message,
+            specialist=self.name,
+            model=resolved_model,
+            allowed_retrieval_ids=allowed_ids,
         )
         self._last_result = result
 

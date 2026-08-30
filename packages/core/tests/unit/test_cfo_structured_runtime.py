@@ -353,18 +353,34 @@ def test_route_to_specialist_cfo_still_returns_str() -> None:
     assert out == "structured answer"
 
 
-def test_cfo_analyze_signature_matches_base_agent() -> None:
-    """route_to_specialist and the sandbox call this by keyword."""
+def test_cfo_analyze_signature_is_substitutable_for_base_agent() -> None:
+    """route_to_specialist and the sandbox call this by keyword.
+
+    CFO may take parameters the base does not — ``retrieval_set`` is one — but
+    only additively: every base parameter must keep its name, position, kind and
+    default, and each extra must be keyword-only WITH a default. Together those
+    make CFO callable exactly as any other specialist, which is what the ~90
+    positional/keyword call sites actually depend on. Asserting the signatures
+    are *identical* would be stricter than the property that matters and would
+    block any per-agent capability from ever being added.
+    """
     import inspect
 
     from openexecutive.agents.base import BaseAgent
 
     base = inspect.signature(BaseAgent.analyze).parameters
     cfo = inspect.signature(FinanceAgent.analyze).parameters
-    assert list(base) == list(cfo)
+
+    # Base parameters come first, in order, unchanged.
+    assert list(cfo)[: len(base)] == list(base)
     for name, param in base.items():
         assert cfo[name].kind == param.kind, name
         assert cfo[name].default == param.default, name
+
+    for name in list(cfo)[len(base):]:
+        extra = cfo[name]
+        assert extra.kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert extra.default is not inspect.Parameter.empty, name
 
 
 def test_router_forwards_every_context_block_to_cfo() -> None:
