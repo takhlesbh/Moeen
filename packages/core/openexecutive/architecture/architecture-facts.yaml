@@ -592,17 +592,133 @@ knowledge:
 
     Scope today: CFO only, and claims are still NOT exposed to the Executive —
     the specialist boundary remains `str`.
+  document_identity: |
+    Ingestion separates the FILE HANDLE from the DOCUMENT IDENTITY.
+    `ingest_file(path, ...)` uses `path` only to read bytes; identity arrives as
+    two keyword-only arguments:
+
+      - `display_filename` → `metadata.filename`, the human-readable label a
+        person and the model see. Display only, never authority.
+      - `document_id` → logical document identity. Opting in ALSO switches chunk
+        ids to `md5(f"doc::{document_id}::chunk::{i}")` and makes ingestion
+        DELETE-THEN-WRITE.
+
+    Two namespaces, deliberately non-overlapping:
+
+      - `company_doc::<safe_filename>` (`loader.company_document_id`) — used by
+        `POST /documents` and by the slot/fixture re-index. The sanitized
+        filename IS the logical key, because the product already works that way:
+        uploads overwrite `company/docs/<safe_filename>`, the listing is that
+        directory, and GET/DELETE address a document by name. The API therefore
+        cannot represent two distinct company documents sharing a basename —
+        re-uploading a name is REPLACEMENT.
+      - `attachment::<uuid4>` (`loader.attachment_document_id`) — used by chat
+        attachments (Discord / Telegram / web-chat multipart; Slack has no
+        attachment ingest). A fresh id per ingest, because
+        `build_attachment_output` receives only `(filename, data, content_type)`
+        and no stable handle. Keying attachments on the filename would let two
+        unrelated `notes.pdf` overwrite each other and would let
+        `DELETE /documents/report.pdf` destroy a chat-shared `report.pdf`.
+        Re-sending an attachment therefore duplicates it, as it did before.
+
+    Delete-then-write is what closes the stale-tail defect: `add_documents` is
+    an upsert, so replacing a 20-chunk document with a 3-chunk one previously
+    left 17 chunks of the OLD text live and retrievable. Extraction runs BEFORE
+    the delete, so replacing a document with an unreadable/empty file keeps the
+    indexed copy rather than erasing it.
+
+    `DELETE /documents/{filename}` removes by `document_id`, never by
+    `filename` — matching on the display name would also sweep a same-named
+    attachment, a document the caller never addressed. Vector rows are deleted
+    before the file is unlinked: if the unlink fails the document is still
+    listed and can be deleted again, whereas the reverse would leave a file with
+    no vectors and no way to notice.
+
+    DISPLAY NAMES ARE SANITIZED (`loader.sanitize_display_filename`). Recording
+    the real filename hands an attacker a write into the retriever's
+    `[{filename}] {text}` template — a chat attachment's name is whatever the
+    sender typed, and the chat upload route does not sanitize it. Unescaped, a
+    name can close its own bracket and open a new line, forging an entire
+    `### SME corrections and context:` block (the highest-trust content in the
+    prompt) or a `[verified - priority source]` marker. This is distinct from
+    the prompt-injection risk already accepted for document BODIES: it forges
+    the application's own attribution framing. So bracket characters, control
+    characters and newlines are dropped, whitespace collapsed, and length
+    bounded, at the single `ingest_file` chokepoint.
+
+    Deletes that matter are STRICT. `store.delete_documents` swallows failures
+    by default (index-sync callers rely on that), so both the replacement delete
+    and `DELETE /documents` pass `strict=True`. Without it a failed delete would
+    let the upload append beside the old version, and would let DELETE return
+    200 after unlinking the file while every chunk stayed live and retrievable —
+    and unreachable forever, since the next DELETE 404s on the missing file.
+
+    Upload REFUSES filesystem-unrepresentable names (embedded NUL, or over 255
+    UTF-8 bytes) before indexing, because vectors are written before the file: a
+    name that passes the extension allowlist but fails `write_bytes` would
+    otherwise commit chunks for a document with no file — invisible to
+    `GET /documents` and permanently undeletable.
+
+    Persistent `document_id` and chunk id are DESCRIPTIVE identity. Neither may
+    authorise an `EvidenceRef` — that remains the invocation-scoped
+    `retrieval_id` (see `retrieval_provenance`). The layering is
+    `document_id → chunk_id → retrieval → fresh retrieval_id → membership check`.
   known_defects: |
-    Company documents uploaded via `POST /documents` (and via Slack/Discord
-    attachment ingest) are chunked from a NamedTemporaryFile, so their
-    `filename`/`source` metadata records the temp name (e.g. `tmprbtpv1gu.pdf`),
-    not the uploaded name. Consequences: the model sees the temp name as the
-    source label; `DELETE /documents/{filename}` deletes by the real name and
-    therefore never matches those chunks (orphans accumulate); and chunk ids,
-    being `md5(f"{path}::chunk::{i}")` over that temp path, are unstable across
-    re-upload. This is why retrieval provenance is keyed on invocation-scoped
-    tokens rather than on filenames. Fixing ingestion identity is tracked as a
-    separate follow-up slice.
+    NOT transactional. Replacement is delete-then-write with no rollback: a
+    crash or store error between the two loses the document rather than
+    restoring the previous version. Likewise `POST /documents` writes vectors
+    before the persistent file, so a failed file write leaves vectors with no
+    file. No transaction manager exists and none is claimed.
+
+    LEGACY DATA: chunks ingested before document identity landed carry a temp
+    `filename`/`source` (e.g. `tmprbtpv1gu.pdf`) and no `document_id`. They stay
+    readable and retrievable but are NOT reachable by `DELETE`, and their
+    original filenames CANNOT be reconstructed — neither `filename` nor `source`
+    retains it, and nothing links a chunk to `company/docs/<real name>`. The
+    sound remedy is to drop the `company_docs` collection and re-ingest from the
+    persisted `company/docs/` files, which the slot/fixture restore path already
+    does. Attachment-only legacy chunks have no file on disk and cannot be
+    reconstructed at all — they require re-upload. No migration is performed.
+
+    SLOT/FIXTURE RE-INDEX IS `*.md` ONLY (`clients/slots.py`,
+    `cli/fixture_loader.py`), while `POST /documents` accepts
+    `.pdf/.docx/.doc/.md/.txt`. Uploaded non-Markdown documents persist to
+    `company/docs/` but are NOT re-indexed on a client-slot switch or fixture
+    load, so they silently vanish from retrieval. Separate, unfixed.
+
+    ATTACHMENTS ARE VECTOR-ONLY — never written to `company/docs/`, so a slot
+    switch (which rebuilds the collection from disk) destroys them permanently.
+    Separate, unfixed.
+
+    CASE AND UNICODE VARIANTS are distinct documents here (Chroma matches
+    metadata exactly) while the filesystem may collapse them: on a
+    case-insensitive volume, uploading `Report.md` then `report.md` leaves ONE
+    file (still named `Report.md`) holding the second upload's bytes, and NFC vs
+    NFD `café.md` behaves the same way anywhere. `DELETE /documents/report.md`
+    then unlinks the file listed as `Report.md` — destroying a document the
+    caller did not address — while `company_doc::Report.md`'s chunks stay live
+    and become unreachable (the file is gone, so any retry 404s). Unfixed: the
+    remedy is to normalise/case-fold document identity, which is a product
+    decision about whether those are the same document, and guessing wrong
+    silently merges two real documents. The case half is macOS/Windows-only;
+    the NFC/NFD half applies wherever a client sends a decomposed name.
+
+    REPLACEMENT IS NOT ATOMIC ACROSS PROCESSES. Within one uvicorn worker there
+    is no await point between the delete and the write, and the deployment runs
+    a single worker, so two concurrent uploads cannot interleave. Two PROCESSES
+    can: the CLI fixture loader or a slot switch running against the same
+    persist directory while the API is live. Interleaved as
+    `A.delete → B.delete → A.add(20) → B.add(3)`, B overwrites chunk indices 0-2
+    and A's 3-19 survive, producing one document whose head and tail come from
+    DIFFERENT content — worse than the stale tail this closes, and
+    indistinguishable from a legitimate document. Relatedly, an upload
+    committing inside `_rebuild_vector_state`'s drop-and-reindex window survives
+    into the NEXT client's collection, which with no tenant field is a
+    cross-company leak. Unfixed; no transaction manager exists.
+
+    NO TENANT FIELD exists in chunk metadata. Cross-company isolation relies on
+    the client-slot invariant that only one company is live at a time, not on
+    anything in the data model. Separate architecture limitation.
 
 memory:
   episodic_db: ./episodic_memory.db

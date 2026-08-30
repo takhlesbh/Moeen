@@ -39,7 +39,18 @@ class KnowledgeStore(ABC):
     def get_collection_count(self, collection: str) -> int: ...
 
     @abstractmethod
-    def delete_documents(self, collection: str, where: dict[str, Any]) -> None: ...
+    def delete_documents(
+        self, collection: str, where: dict[str, Any], *, strict: bool = False
+    ) -> None:
+        """Delete rows matching ``where``. Best-effort unless ``strict``.
+
+        ``strict=True`` is for callers whose correctness depends on the delete
+        having actually happened — notably delete-then-write replacement, where
+        a swallowed failure would leave the previous version in place and then
+        append the new one, silently producing a document that is half old and
+        half new.
+        """
+        ...
 
 
 class ChromaDBStore(KnowledgeStore):
@@ -163,12 +174,28 @@ class ChromaDBStore(KnowledgeStore):
         except Exception:
             return 0
 
-    def delete_documents(self, collection: str, where: dict[str, Any]) -> None:
+    def delete_documents(
+        self, collection: str, where: dict[str, Any], *, strict: bool = False
+    ) -> None:
+        """Delete rows matching ``where``.
+
+        Swallows failures by default — the long-standing behaviour for the
+        index-sync callers (talent, skills, fixtures), where a delete that fails
+        must never break the CRUD operation that triggered it.
+
+        ``strict=True`` re-raises instead. Replacement callers need that: they
+        delete the old version and then write the new one, so a silently failed
+        delete turns a clean replace into an append, resurrecting exactly the
+        stale-chunk defect delete-then-write exists to prevent. Failing the
+        request is the lesser harm — it is visible and retryable, whereas a
+        half-old/half-new document is neither.
+        """
         try:
             col = self._get_or_create_collection(collection)
             col.delete(where=where)
         except Exception:
-            pass
+            if strict:
+                raise
 
     def delete_company_docs(self) -> None:
         """Delete and recreate the company_docs collection, clearing all indexed documents."""

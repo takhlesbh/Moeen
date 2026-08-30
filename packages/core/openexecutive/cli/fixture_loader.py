@@ -397,7 +397,7 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     (source = ``_user_backup/`` dir). Wipes the company-side state before
     writing, so the source dir is fully authoritative.
     """
-    from openexecutive.knowledge.loader import ingest_file
+    from openexecutive.knowledge.loader import company_document_id, ingest_file
     from openexecutive.knowledge.store import ChromaDBStore
     from openexecutive.memory.company_profile import CompanyProfile
 
@@ -434,10 +434,15 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
 
     docs_indexed = 0
     for dest_doc in sorted(company_docs_dir.glob("*.md")):
+        # Same logical identity an upload of this file would produce, so a
+        # fixture-loaded document stays deletable through
+        # DELETE /documents/{filename} (which addresses by document_id).
         docs_indexed += await ingest_file(
             path=dest_doc,
             store=store,
             collection=ChromaDBStore.COMPANY_COLLECTION,
+            display_filename=dest_doc.name,
+            document_id=company_document_id(dest_doc.name),
         )
 
     # ── 4. Seed people first so episodic seeding can resolve
