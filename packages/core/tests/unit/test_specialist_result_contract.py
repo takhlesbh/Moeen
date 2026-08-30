@@ -1261,15 +1261,22 @@ def test_verification_status_literal_is_absent_from_the_tool_schema() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_contract_is_not_imported_by_any_production_module() -> None:
-    """Slice 1 ships dead code on purpose; wiring lands in a later slice."""
+def test_only_cfo_imports_the_contract() -> None:
+    """CFO is the single wired specialist; the migration must not spread.
+
+    Slice 1 shipped this module as dead code and asserted zero importers. The
+    CFO wiring slice made ``agents/finance.py`` the one exception, and this test
+    now pins that exact set — so a second specialist (or a workflow, or the
+    Executive) importing the contract fails here rather than quietly widening
+    the migration.
+    """
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[2] / "openexecutive"
-    importers = [
-        path
+    importers = sorted(
+        path.relative_to(root).as_posix()
         for path in root.rglob("*.py")
         if "specialists/" not in path.as_posix()
         and "result_contract" in path.read_text(encoding="utf-8")
-    ]
-    assert importers == [], [p.name for p in importers]
+    )
+    assert importers == ["agents/finance.py"], importers

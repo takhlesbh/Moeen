@@ -48,6 +48,7 @@ import json
 import logging
 import unicodedata
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -526,6 +527,26 @@ EMIT_SPECIALIST_RESULT_TOOL: dict[str, Any] = {
         "required": ["narrative"],
     },
 }
+
+
+def emit_specialist_result_tool() -> dict[str, Any]:
+    """A fresh, independent copy of the tool schema, safe to hand to a provider.
+
+    Use this rather than the module constant at any call site. The constant is a
+    plain nested dict, so the usual idiom for tagging a tool —
+    ``{**TOOL, "cache_control": ...}`` (see ``orchestrator/executive.py``) — is a
+    *shallow* copy that still shares ``input_schema`` by reference. One caller
+    reordering or editing that nested dict would change the schema every other
+    caller sees, and once this tool lands inside a ``cache_control`` block a
+    reordering also invalidates the cached prefix for every subsequent request.
+
+    A deep copy per call is the smallest fix that needs no discipline from
+    callers. The cost is negligible next to the provider round trip it precedes,
+    and the constant stays exported so existing tests can assert against the
+    canonical template.
+    """
+    return deepcopy(EMIT_SPECIALIST_RESULT_TOOL)
+
 
 # Fields the model is never allowed to populate, even if it invents them. The
 # tool schema above omits them, so reaching this list means the model went
