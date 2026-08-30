@@ -158,16 +158,41 @@ def _schedule_ingest(data: bytes, filename: str) -> None:
     async def _run() -> None:
         suffix = _suffix_from_filename(filename)
         try:
-            from openexecutive.knowledge.loader import ingest_file
+            from openexecutive.config import get_settings
+            from openexecutive.knowledge.loader import (
+                attachment_document_id,
+                ingest_file,
+            )
             from openexecutive.knowledge.store import ChromaDBStore
 
-            store = ChromaDBStore()
+            # Explicit persist directory. The default is `./chroma_db`, relative
+            # to the process CWD — which in Docker/Fly is `/app`, while the API,
+            # retrieval and the slot rebuild all use VECTOR_STORE_PATH
+            # (`/data/chroma_db`). Attachment chunks were therefore being written
+            # to a store nothing ever reads.
+            store = ChromaDBStore(
+                persist_directory=get_settings().vector_store_path
+            )
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(data)
                 tmp_path = Path(tmp.name)
 
             try:
-                count = await ingest_file(tmp_path, store, domain="company_docs")
+                # `filename` is the attachment's real name — it was already in
+                # this function's signature and, before this, was used only for
+                # the log line while the temp file's name was what got indexed.
+                #
+                # A fresh document id per ingest, NOT one keyed on the filename:
+                # attachments have no stable logical handle here, so keying on
+                # the name would let two unrelated files called "notes.pdf"
+                # delete one another. Re-sending duplicates, as it does today.
+                count = await ingest_file(
+                    tmp_path,
+                    store,
+                    domain="company_docs",
+                    display_filename=filename,
+                    document_id=attachment_document_id(),
+                )
                 logger.info(
                     "attachments: indexed %d chunks from %s into ChromaDB",
                     count,

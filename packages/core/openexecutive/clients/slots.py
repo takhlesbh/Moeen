@@ -619,7 +619,7 @@ async def _rebuild_vector_state(settings: Any, app_state: Any | None) -> int:
     Returns the number of company-doc chunks indexed. Isolated here so tests
     can stub the vector layer without touching the file/DB round-trip logic.
     """
-    from openexecutive.knowledge.loader import ingest_file
+    from openexecutive.knowledge.loader import company_document_id, ingest_file
     from openexecutive.knowledge.skills_index import SKILLS_COLLECTION, index_skill
     from openexecutive.knowledge.skills_repo import list_skills
     from openexecutive.knowledge.store import ChromaDBStore
@@ -635,8 +635,15 @@ async def _rebuild_vector_state(settings: Any, app_state: Any | None) -> int:
     company_docs_dir: Path = settings.company_profile_path.parent / "docs"
     docs_indexed = 0
     for doc in sorted(company_docs_dir.glob("*.md")):
+        # Same logical identity an upload of this file would produce, so a
+        # restored document stays deletable through DELETE /documents/{filename}
+        # (which addresses documents by document_id, not by display name).
         docs_indexed += await ingest_file(
-            path=doc, store=store, collection=ChromaDBStore.COMPANY_COLLECTION
+            path=doc,
+            store=store,
+            collection=ChromaDBStore.COMPANY_COLLECTION,
+            display_filename=doc.name,
+            document_id=company_document_id(doc.name),
         )
 
     # Company-authored skills: drop the old client's rows, index the restored set.

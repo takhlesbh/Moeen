@@ -161,11 +161,13 @@ class RetrievedEvidenceChunk(BaseModel):
 
     * ``chunk_id`` — the store's persistent record id. Global and stable, hence
       useless as authority: a replayed one would still "exist".
-    * ``document_label`` — the ``[filename]`` the model sees. Display text. It
-      is not trustworthy even as a *label*: documents ingested through
-      ``POST /documents`` currently carry the upload's temp-file name (see
-      ``retrieval_provenance`` in ``architecture-facts.yaml``), so two distinct
-      documents can share one, and a real one can be guessed.
+    * ``document_label`` — the ``[filename]`` the model sees. Display text, and
+      still not trustworthy as a *label*: it is now the document's real
+      sanitized name (see ``document_identity`` in ``architecture-facts.yaml``)
+      rather than the upload's temp-file name, but a name is guessable, is
+      chosen by whoever uploaded or sent the file, and two documents from
+      different ingest paths can share one. Identity lives in ``chunk_id`` /
+      ``document_id``; authority lives only in ``retrieval_id``.
     * ``collection`` / ``chunk_index`` / ``distance`` — retrieval context.
 
     The token is NOT a secret and NOT a capability. It is an invocation-scoped

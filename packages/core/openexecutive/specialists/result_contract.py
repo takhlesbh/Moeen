@@ -175,9 +175,10 @@ class EvidenceRef(_ContractModel):
     established, whatever ``label`` and ``filename`` happen to say.
 
     The distinction matters because ``label`` and ``filename`` are guessable and
-    non-unique — the upload path currently stores temp-file names, so two
-    different documents can share one — while a token cannot be guessed and
-    cannot be carried over from an earlier call.
+    non-unique: they are now the document's real sanitized name rather than the
+    upload's temp-file name, but the name is chosen by whoever supplied the
+    file, and documents from different ingest paths can share one. A token can
+    be neither guessed nor carried over from an earlier call.
     """
 
     kind: EvidenceKind

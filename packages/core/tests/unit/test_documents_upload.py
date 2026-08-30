@@ -20,10 +20,16 @@ from openexecutive.api.routes import documents
 
 class _CapturingStore:
     """Records the metadata passed to add_documents so the test can assert
-    the domain tag without standing up a real ChromaDB / embedding model."""
+    the domain tag without standing up a real ChromaDB / embedding model.
+
+    Also records ``delete_documents`` calls: ingestion is delete-then-write for
+    documents that carry a ``document_id``, so a fake that omits the method no
+    longer models the interface the route uses.
+    """
 
     def __init__(self) -> None:
         self.added: list[dict[str, Any]] = []
+        self.deleted: list[tuple[str, dict[str, Any]]] = []
 
     def add_documents(
         self,
@@ -33,6 +39,11 @@ class _CapturingStore:
         collection: str,
     ) -> None:
         self.added.extend(metadatas)
+
+    def delete_documents(
+        self, collection: str, where: dict[str, Any], *, strict: bool = False
+    ) -> None:
+        self.deleted.append((collection, where))
 
 
 @pytest.fixture

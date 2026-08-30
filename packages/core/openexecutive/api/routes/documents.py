@@ -30,6 +30,16 @@ async def upload_document(
     if not safe_filename or safe_filename.startswith("."):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
+    # Reject names the filesystem cannot represent BEFORE anything is indexed.
+    # Vectors are written before the persistent file, so a name that passes the
+    # extension allowlist but blows up `dest.write_bytes` (an embedded NUL, or a
+    # component over the OS limit) would commit chunks for a document that then
+    # has no file — invisible to GET /documents and permanently undeletable,
+    # since DELETE 404s on the missing file. That is a durable injection
+    # primitive, so it is refused up front rather than half-committed.
+    if "\x00" in safe_filename or len(safe_filename.encode("utf-8")) > 255:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     ext = Path(safe_filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -47,7 +57,7 @@ async def upload_document(
 
     try:
         from openexecutive.config import get_settings
-        from openexecutive.knowledge.loader import ingest_file
+        from openexecutive.knowledge.loader import company_document_id, ingest_file
         from openexecutive.knowledge.store import ChromaDBStore
 
         settings = get_settings()
@@ -57,11 +67,17 @@ async def upload_document(
             else ChromaDBStore(persist_directory=settings.vector_store_path)
         )
 
+        # `tmp_path` is only where the bytes live for extraction. Identity comes
+        # from `safe_filename` — the same key the destination path below, the
+        # listing, and DELETE all use — so a re-upload replaces this document
+        # instead of accumulating a second copy under a fresh temp name.
         chunks_indexed = await ingest_file(
             path=tmp_path,
             store=store,
             domain=domain,
             collection=ChromaDBStore.COMPANY_COLLECTION,
+            display_filename=safe_filename,
+            document_id=company_document_id(safe_filename),
         )
 
         company_docs_dir = settings.company_profile_path.parent / "docs"
@@ -157,6 +173,7 @@ async def delete_document(
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     from openexecutive.config import get_settings
+    from openexecutive.knowledge.loader import company_document_id
     from openexecutive.knowledge.store import ChromaDBStore
 
     settings = get_settings()
@@ -170,9 +187,28 @@ async def delete_document(
         if request and hasattr(request.app.state, "store")
         else ChromaDBStore(persist_directory=settings.vector_store_path)
     )
+    # Delete by logical document identity, NOT by the display filename. Matching
+    # on `filename` would also sweep away chat-attachment chunks that happen to
+    # share a name — a different document the caller never addressed. The
+    # namespaced document_id cannot collide across ingest paths.
+    #
+    # `strict=True` is what makes the 200 honest. The default best-effort mode
+    # swallows every failure, so a locked/corrupt/read-only store would return
+    # `{"deleted": …}` after unlinking the file while every chunk stayed live and
+    # retrievable — and unreachable forever, because the next DELETE 404s on the
+    # missing file. "Delete my data" must not silently mean "hide it from the UI
+    # and keep feeding it to the model". Raising here aborts before the unlink,
+    # so the document stays listed and the request can be retried.
     store.delete_documents(
         collection=ChromaDBStore.COMPANY_COLLECTION,
-        where={"filename": safe},
+        where={"document_id": company_document_id(safe)},
+        strict=True,
     )
-    path.unlink()
+    # Vector rows first, then the file: a failed unlink leaves a listed document
+    # that can be deleted again, whereas the reverse leaves a file with no
+    # vectors and no way to notice. `missing_ok` because two concurrent deletes
+    # (or a delete racing an upload's write) would otherwise 500 after the rows
+    # are already gone. Neither step is transactional — see
+    # `knowledge.known_defects`.
+    path.unlink(missing_ok=True)
     return {"deleted": safe}
