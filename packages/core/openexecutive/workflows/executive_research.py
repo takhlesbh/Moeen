@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
@@ -58,6 +58,9 @@ from openexecutive.workflows.base import (
     WorkflowSection,
     WorkflowStepDef,
 )
+
+if TYPE_CHECKING:
+    from openexecutive.clients.context_guard import CompanyContext
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +351,18 @@ class ExecutiveResearchWorkflow(Workflow):
     ) -> AsyncIterator[WorkflowEvent]:
         assert isinstance(inputs, ExecutiveResearchInput)
 
+        # Which company this research belongs to, captured at ORIGIN — before
+        # any of the minutes-long specialist / verification / synthesis awaits
+        # below. The trailing persistence writes into RESEARCH_COLLECTION, which
+        # IS company-scoped (a slot switch deletes `type=recent_research`
+        # precisely because research must not carry across companies), and the
+        # nightly rotation runs research for the live client immediately before
+        # switching. Capturing near the write instead would just read whichever
+        # company won the race and pass.
+        from openexecutive.clients.context_guard import capture_company_context
+
+        origin = capture_company_context()
+
         # ------------------------------------------------------------------
         # Step 1: gather_context
         # ------------------------------------------------------------------
@@ -560,7 +575,7 @@ class ExecutiveResearchWorkflow(Workflow):
             step_title="Executive routes findings",
         )
 
-        narrative, tool_calls = await _executive_synthesis_loop(deduped)
+        narrative, tool_calls = await _executive_synthesis_loop(deduped, origin=origin)
 
         # Dedicated watchlist-analysis pass — an explicit, forward-looking
         # decision about what to MONITOR going forward, with its own budget
@@ -569,7 +584,7 @@ class ExecutiveResearchWorkflow(Workflow):
         # so they surface in the artifact + result event + audit count.
         try:
             watchlist_calls = await _watchlist_analysis_loop(
-                deduped, existing_watchlist,
+                deduped, existing_watchlist, origin=origin,
             )
         except Exception:
             logger.exception("research: watchlist-analysis pass failed")
@@ -607,26 +622,57 @@ class ExecutiveResearchWorkflow(Workflow):
         # collection (keep-latest), so the next run + the chat Executive can
         # recall it via RAG. Separate collection, clearly labelled at
         # retrieval — never blended into curated company docs. Best-effort.
+        from openexecutive.clients.context_guard import StaleCompanyContextError
+
         try:
             from datetime import UTC, datetime
 
+            from openexecutive.clients.context_guard import company_mutation_guard
             from openexecutive.knowledge.loader import ingest_text
             from openexecutive.knowledge.store import ChromaDBStore
 
             now = datetime.now(UTC)
-            store.delete_documents(
-                ChromaDBStore.RESEARCH_COLLECTION,
-                where={"type": "recent_research"},
-            )
-            await ingest_text(
-                artifact,
-                store,
-                source_name=f"recent_research_{now.date().isoformat()}",
-                collection=ChromaDBStore.RESEARCH_COLLECTION,
-                extra_metadata={
-                    "type": "recent_research",
-                    "created_at": now.isoformat(),
-                },
+            # The guard opens only around the commit — never around the
+            # specialist fan-out, verification, synthesis or watchlist loops
+            # above, which run LLM and network calls for minutes. Holding the
+            # company-state lock across those would stall every slot switch and
+            # the nightly rotation itself.
+            #
+            # BOTH statements belong inside: the delete is destructive and
+            # company-scoped, so a stale run reaching it would wipe the NEW
+            # company's research even if the subsequent write were blocked.
+            async with company_mutation_guard(
+                origin, operation="executive research"
+            ):
+                store.delete_documents(
+                    ChromaDBStore.RESEARCH_COLLECTION,
+                    where={"type": "recent_research"},
+                )
+                await ingest_text(
+                    artifact,
+                    store,
+                    source_name=f"recent_research_{now.date().isoformat()}",
+                    collection=ChromaDBStore.RESEARCH_COLLECTION,
+                    extra_metadata={
+                        "type": "recent_research",
+                        "created_at": now.isoformat(),
+                    },
+                )
+        except StaleCompanyContextError:
+            # Caught BEFORE the generic handler so a deliberate rejection is not
+            # logged as a persistence failure. The artifact is NOT written and
+            # NOT retried under the now-active company — the research describes
+            # the company it was run for, and reinterpreting it as the new
+            # client's would be the disclosure this guards against.
+            #
+            # The run still completes and still yields its artifact and result
+            # events: persistence is already best-effort here (the pre-existing
+            # `except Exception` swallowed failures and continued), so callers —
+            # the cron, the chat tool, onboarding — keep the contract they have
+            # today. Only the company-scoped write is dropped.
+            logger.warning(
+                "research: not persisting artifact — the company it was run "
+                "for is no longer active"
             )
         except Exception:
             logger.exception("research: persist artifact to knowledge failed")
@@ -674,6 +720,8 @@ class ExecutiveResearchWorkflow(Workflow):
 
 async def _executive_synthesis_loop(
     findings: list[ResearchFinding],
+    *,
+    origin: CompanyContext | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run the Executive's tool-use loop over the deduped findings.
 
@@ -779,10 +827,14 @@ async def _executive_synthesis_loop(
 
             ok_so_far = _routing_ok(tool_calls)
             budget_remaining = max(0, _MAX_ROUTING_TOOLS_PER_RUN - ok_so_far)
+            # `origin` is the context captured at the TOP of `run()`, threaded
+            # down unchanged. Each company-bound handler runs under it; the
+            # provider call above stays outside the lock.
             iter_calls = await execute_tool_calls(
                 response, _ALL_SKILL_HANDLERS,
                 budget_remaining=budget_remaining,
                 free_tools=_NON_ROUTING_TOOLS,
+                origin_company_context=origin,
             )
             tool_calls.extend(iter_calls)
 
@@ -869,6 +921,8 @@ async def _executive_synthesis_loop(
 async def _watchlist_analysis_loop(
     findings: list[ResearchFinding],
     existing_watchlist: list[Any],
+    *,
+    origin: CompanyContext | None = None,
 ) -> list[dict[str, Any]]:
     """Dedicated forward-looking pass: decide what to MONITOR going forward
     and call ``add_watchlist_entry`` for each.
@@ -920,6 +974,7 @@ async def _watchlist_analysis_loop(
         budget_remaining = max(0, _MAX_WATCHLIST_ADDS_PER_RUN - ok_so_far)
         iter_calls = await execute_tool_calls(
             response, handlers, budget_remaining=budget_remaining,
+            origin_company_context=origin,
         )
         tool_calls.extend(iter_calls)
 

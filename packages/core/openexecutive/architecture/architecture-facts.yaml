@@ -663,7 +663,190 @@ knowledge:
     authorise an `EvidenceRef` — that remains the invocation-scoped
     `retrieval_id` (see `retrieval_provenance`). The layering is
     `document_id → chunk_id → retrieval → fresh retrieval_id → membership check`.
+  company_isolation: |
+    A company-bound write must not commit into a different company than the one
+    it started in. Without this, an upload begun while client A was active could
+    finish AFTER a switch to client B — the nightly `client_rotation` switches
+    unattended — and A's chunks and A's file both landed in B's live state, with
+    no tenant field to catch it and nothing downstream able to tell the leaked
+    document from B's own.
+
+    `clients/context_guard.py` closes it in three steps:
+
+      1. `capture_company_context()` at ORIGIN — request entry for
+         `POST /documents`, schedule time for a chat attachment. Capturing later
+         would just read whichever company won the race.
+      2. slow work (the up-to-50MB read, extraction) happens OUTSIDE any lock.
+      3. `company_mutation_guard(origin)` takes the SAME `_FIXTURE_OP_LOCK` every
+         slot/fixture mutation takes, RE-READS the context while holding it, and
+         refuses on mismatch. Verifying before locking would leave a window for a
+         switch to land between the check and the commit.
+
+    `CompanyContext` carries BOTH the active client slug and the active fixture,
+    because a fixture load calls `park_active_client` (which unlinks the client
+    sentinel), so a fixture→fixture swap reads as `None → None` on the client
+    alone. Comparison is dataclass equality, so `None` participates: `None→None`
+    and `A→A` pass; `A→B`, `A→None` and `None→B` are all rejected. A truthiness
+    shortcut would silently allow every transition out of single-company mode.
+
+    On mismatch: `POST /documents` returns **409 Conflict** ("Active company
+    changed during upload. Please retry.") with nothing written and the temp file
+    cleaned; a chat attachment is DROPPED with a warning and never redirected
+    into the now-active company. Neither retries by itself — where the document
+    belongs is the user's decision.
+
+    This is a LOCKING identity, not a persisted tenant field: it is compared
+    in-process and never written into chunk metadata. No tenant model exists.
+
+    `DELETE /documents` is deliberately unguarded: it has ZERO awaits after it
+    resolves settings (the `where` delete and the unlink are both synchronous),
+    so no switch can interleave. Guarding it would add surface without closing a
+    race.
+
+    NEVER take this lock inside `knowledge/loader.py`: slot restore already holds
+    it and calls `ingest_file`, and `asyncio.Lock` is not reentrant, so a guard
+    there would deadlock every restore. A test asserts `loader.py` neither
+    imports nor references it.
+
+    Capture happens in ASGI MIDDLEWARE (`install_company_context_middleware`),
+    not in the route. FastAPI resolves `UploadFile`/`Form` dependencies before
+    entering the handler, so the whole multipart body is streamed and spooled
+    first — instrumenting `MultiPartParser.parse` gives
+    `middleware → parse-START → parse-DONE → handler → file.read()`. A
+    handler-level capture would therefore run AFTER the slow transfer, read the
+    post-switch company, compare equal to itself, and let the write through.
+    The handler reads the captured value via `context_from_request`.
+
+    Unreadable context FAILS CLOSED. `get_active_client` and
+    `get_fixture_status` both swallow their own errors and return `None`, so a
+    permissions accident or a malformed slug would otherwise make capture and
+    verify both read `(None, None)`, compare equal, and silently turn this
+    control into a no-op. `capture_company_context` detects that case (sentinel
+    present but unreadable) and returns a context carrying a unique
+    `unreadable_id`, which compares unequal to everything — including another
+    unreadable context — so the commit is rejected and logged.
+
+    WHAT IS COVERED:
+      - `POST /documents` — vector write, persistent file write, and the
+        proactive-alert SCHEDULING decision.
+      - `alerts/pipeline.py` — the detached triage task. `schedule_evaluation`
+        captures the context synchronously and hands it to
+        `evaluate_and_dispatch`, which keeps `agent.triage` OUTSIDE the lock and
+        then wraps `insert_alert` + the read-back + `dispatch_all` in ONE guard.
+        One guard, not two: verifying, releasing, then dispatching would leave a
+        TOCTOU window for a switch to land between the row write and the send.
+        A stale alert is dropped — not inserted, not sent, not re-triaged for
+        whoever is now live. The `threading.Thread` + `asyncio.run` fallback
+        (no running loop) verifies WITHOUT the lock, because an `asyncio.Lock`
+        cannot cross event loops: an uncontended acquire silently serialises
+        nothing and a contended one raises. That path catches a switch that
+        already completed, but is explicitly not serialised.
+      - Chat attachments (Discord / Telegram / web-chat) — schedule-time
+        capture, commit-time verification, drop on mismatch.
+      - `workflows/executive_research.py` — the trailing persistence into
+        RESEARCH_COLLECTION. Origin is captured at the top of `run()`, before
+        the specialist fan-out / verification / synthesis / watchlist awaits
+        (minutes of LLM and network work, none of it under the lock). BOTH the
+        `delete_documents` and the `ingest_text` sit inside one guard: the
+        delete is destructive and company-scoped, so a stale run reaching it
+        would wipe the NEW company's research even if the write were blocked.
+        A stale run drops persistence, logs, and still yields its artifact and
+        result events — persistence was already best-effort there, so callers
+        (cron, chat tool, onboarding) keep today's contract.
+      - `DELETE /documents` needs no guard: zero awaits after settings
+        resolution.
+
+      - `workflows/_synthesis.execute_tool_calls` — a PER-CALL guard, because
+        the research loops execute outbound tools BETWEEN provider awaits, not
+        after them, so a commit-boundary guard cannot reach them. The origin
+        captured at the top of `run()` is threaded down unchanged; each
+        company-bound handler invocation runs under it, and nothing else does —
+        never the provider call, the iteration, or the loop. A stale call is
+        SKIPPED with an `ok=False` summary entry ("not executed — active company
+        changed") so the model sees the action did not happen. `READ_ONLY_TOOLS`
+        is an allowlist of pure reads that are NOT serialised; everything else is
+        guarded, so a handler added later is protected by default.
+        `origin_company_context` is keyword-only and defaults to `None`, so
+        `executive_reflection` and every other caller are unaffected.
+
+      - `memory/episodic.schedule_extraction` — fires on EVERY chat turn.
+        Captures synchronously, awaits the LLM extraction OUTSIDE the lock, then
+        wraps the whole write block (decisions, initiatives, advice) in ONE
+        guard: they are a single turn's memory and must land together or not at
+        all. A stale turn is dropped, never reinterpreted as the new company's.
+      - `memory/honcho_client` `sync_turn` / `sync_department_turn` /
+        `append_department_note` — a different resource, so a different fix.
+        These write to a remote Honcho WORKSPACE, and `_get_client()` resolves
+        `get_active_workspace_id()` at the moment of a cache miss; a slot switch
+        calls `set_active_workspace_id`, which DROPS the client cache, so a task
+        reaching the factory after the switch builds a client bound to the next
+        client's workspace. The Honcho client is otherwise safe — `workspace_id`
+        is a constructor argument and nothing re-reads it during the SDK call —
+        so the destination is pinned at schedule time and passed explicitly
+        (`_get_client_for_workspace`). No lock is held across the remote write,
+        and when the pinned workspace still matches the live one the ordinary
+        cached client is used.
+
+    WHAT IS NOT COVERED — see `known_defects`. The guarantee is bounded to the
+    audited Pilot paths in a single process; it is not "company isolation is
+    closed" as a global property.
+
+    **SINGLE-PROCESS GUARANTEE ONLY.** `asyncio.Lock` is process-local, so this
+    does NOT protect against a second uvicorn worker, a CLI run, or any other
+    process sharing `vector_store_path`. See `known_defects`.
   known_defects: |
+    AUDITED PILOT BACKGROUND TASKS ARE CLOSED — within a single process. Every
+    detached task reachable from the normal Pilot paths (Executive.chat /
+    stream_chat, document upload, chat attachments, alert pipeline, executive
+    research, monitoring alert scheduling) now captures its company context at
+    SCHEDULE time and verifies at COMMIT time: alert triage, research
+    persistence, research per-call tools, episodic extraction, and the three
+    Honcho syncs. That is the audited inventory, not a claim about the whole
+    repository — CLI, eval and admin paths were explicitly out of scope, and
+    nothing here makes company isolation a global property.
+
+    (Historic, now closed — retained so the reasoning is not lost:)
+
+    `workflows/executive_research.py`'s `_executive_synthesis_loop` and
+    `_watchlist_analysis_loop` run `execute_tool_calls(response,
+    _ALL_SKILL_HANDLERS, ...)` INSIDE their iteration loop — that is, between
+    provider awaits, not after them. `_ALL_SKILL_HANDLERS` includes
+    `BROADCAST_TOOL_HANDLERS` (`send_department_message`), `create_alert`,
+    `WATCHLIST_TOOL_HANDLERS` and `SCHEDULE_TOOL_HANDLERS`.
+
+    `handle_send_department_message` calls `departments.store.get_department(slug)`
+    at CALL time, which reads `EPISODIC_DB_PATH` — a fixed path whose FILE the
+    slot switch swaps (`_save_slot_state` / `_restore_slot_state` copy
+    `state.db` in and out). Proven by probe: holding the path constant and
+    replacing the DB file changes the resolved channel id
+    (`C_CLIENT_A_ROOM` → `C_CLIENT_B_ROOM`).
+
+    Reachable path: a research run is in flight under client A (the research
+    cron defaults to every 120 minutes) → a switch lands during one of the
+    loop's provider awaits (the nightly rotation, or an operator using
+    `POST /clients/{slug}/activate`) → a tool call in a LATER iteration resolves
+    the NEXT client's channel and posts content derived from A's research into
+    B's team room. Severity HIGH: disclosure to another client's humans.
+
+    A commit-boundary guard cannot cover this — the calls are interleaved with
+    the LLM work, and holding the lock across those loops would stall the very
+    rotation that switches the client. Smallest seam: `execute_tool_calls` takes
+    the originating `CompanyContext` and, for the subset of handlers that
+    perform company-bound writes or outbound sends, verifies it under
+    `company_mutation_guard` around each individual handler invocation —
+    skipping the call and recording an over-budget-style summary entry on
+    mismatch. That is a per-call check, a different shape from the three
+    commit-boundary guards, and is NOT attempted here.
+
+    COMPANY ISOLATION IS SINGLE-PROCESS ONLY. `company_isolation` closes the
+    ingest/slot race within one event loop. A second uvicorn worker, a
+    concurrent CLI fixture/slot operation, or any other process on the same
+    `vector_store_path` holds a DIFFERENT `asyncio.Lock` object and is not
+    serialised against it, so the cross-company write remains reachable there.
+    Closing that needs a cross-process mechanism (file lock, DB advisory lock)
+    and is deliberately not attempted. Do not read the guard as cross-process
+    safety.
+
     NOT transactional. Replacement is delete-then-write with no rollback: a
     crash or store error between the two loses the document rather than
     restoring the previous version. Likewise `POST /documents` writes vectors
@@ -711,10 +894,11 @@ knowledge:
     `A.delete → B.delete → A.add(20) → B.add(3)`, B overwrites chunk indices 0-2
     and A's 3-19 survive, producing one document whose head and tail come from
     DIFFERENT content — worse than the stale tail this closes, and
-    indistinguishable from a legitimate document. Relatedly, an upload
-    committing inside `_rebuild_vector_state`'s drop-and-reindex window survives
-    into the NEXT client's collection, which with no tenant field is a
-    cross-company leak. Unfixed; no transaction manager exists.
+    indistinguishable from a legitimate document. Unfixed; no transaction
+    manager exists. (The *cross-company* half of this — an upload landing in the
+    next client's collection — is closed within one process by
+    `company_isolation` FOR THE PATHS IT COVERS; across processes, and for the
+    unguarded writers listed above, it remains open.)
 
     NO TENANT FIELD exists in chunk metadata. Cross-company isolation relies on
     the client-slot invariant that only one company is live at a time, not on

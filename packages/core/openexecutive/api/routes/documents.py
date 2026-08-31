@@ -12,6 +12,43 @@ router = APIRouter()
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".md", ".txt"}
 
 
+def _schedule_document_alert(
+    *, ext: str, content: bytes, safe_filename: str, domain: str
+) -> None:
+    """Queue proactive-alert triage for a freshly ingested document.
+
+    Extracted from the upload handler so it can be called from inside the
+    company guard — see the call site for why that placement matters. Body is a
+    best-effort excerpt for triage context; PDFs/docx won't decode cleanly and
+    that's fine, the triage prompt still sees source, title, and domain.
+
+    Never raises: an alert failure must not 500 an upload that already committed.
+    """
+    try:
+        from openexecutive.alerts.models import AlertEvent
+        from openexecutive.alerts.pipeline import schedule_evaluation
+
+        if ext in {".md", ".txt"}:
+            excerpt = content[:8000].decode("utf-8", errors="replace")
+        else:
+            excerpt = f"Newly ingested {ext} document: {safe_filename} (domain: {domain})"
+
+        schedule_evaluation(
+            AlertEvent(
+                source="document",
+                external_id=safe_filename,
+                title=safe_filename,
+                body=excerpt,
+            )
+        )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Failed to schedule alert evaluation for document upload"
+        )
+
+
 @router.post("/documents", response_model=DocumentUploadResponse)
 async def upload_document(
     file: UploadFile,
@@ -22,6 +59,15 @@ async def upload_document(
     domain: str = Form("general"),
     request: Request = None,  # type: ignore[assignment]
 ) -> DocumentUploadResponse:
+    from openexecutive.clients.context_guard import context_from_request
+
+    # Read what the middleware captured BEFORE the body was parsed. Capturing
+    # here instead would be too late: FastAPI spools the entire multipart body
+    # during dependency resolution, so by the time this handler runs the (up to
+    # 50 MB, possibly slow) transfer is already over and a switch during it
+    # would be read as the ORIGIN — self-consistent, and wrong.
+    origin = context_from_request(request)
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
 
@@ -56,63 +102,75 @@ async def upload_document(
         tmp_path = Path(tmp.name)
 
     try:
+        from openexecutive.clients.context_guard import (
+            StaleCompanyContextError,
+            company_mutation_guard,
+        )
         from openexecutive.config import get_settings
         from openexecutive.knowledge.loader import company_document_id, ingest_file
         from openexecutive.knowledge.store import ChromaDBStore
 
-        settings = get_settings()
-        store = (
-            request.app.state.store
-            if request and hasattr(request.app.state, "store")
-            else ChromaDBStore(persist_directory=settings.vector_store_path)
-        )
-
-        # `tmp_path` is only where the bytes live for extraction. Identity comes
-        # from `safe_filename` — the same key the destination path below, the
-        # listing, and DELETE all use — so a re-upload replaces this document
-        # instead of accumulating a second copy under a fresh temp name.
-        chunks_indexed = await ingest_file(
-            path=tmp_path,
-            store=store,
-            domain=domain,
-            collection=ChromaDBStore.COMPANY_COLLECTION,
-            display_filename=safe_filename,
-            document_id=company_document_id(safe_filename),
-        )
-
-        company_docs_dir = settings.company_profile_path.parent / "docs"
-        company_docs_dir.mkdir(parents=True, exist_ok=True)
-        dest = company_docs_dir / safe_filename
-        dest.write_bytes(content)
-
-        # Fire the proactive-alerts pipeline. Body is a best-effort excerpt
-        # for triage context; PDFs/docx won't decode cleanly and that's fine —
-        # the triage prompt still sees source, title, and domain.
+        # The guard opens HERE, after the (up to 50 MB) read and the temp-file
+        # staging above — holding the company-state lock across a slow client
+        # upload would block every slot switch for its duration. Everything
+        # company-bound happens inside it: settings resolution, the store
+        # handle, the vector write and the file write. A commit placed after the
+        # block would reopen the exact window this closes.
         try:
-            from openexecutive.alerts.models import AlertEvent
-            from openexecutive.alerts.pipeline import schedule_evaluation
-
-            excerpt = ""
-            if ext in {".md", ".txt"}:
-                excerpt = content[:8000].decode("utf-8", errors="replace")
-            else:
-                excerpt = f"Newly ingested {ext} document: {safe_filename} (domain: {domain})"
-
-            schedule_evaluation(
-                AlertEvent(
-                    source="document",
-                    external_id=safe_filename,
-                    title=safe_filename,
-                    body=excerpt,
+            async with company_mutation_guard(origin, operation="document upload"):
+                settings = get_settings()
+                store = (
+                    request.app.state.store
+                    if request and hasattr(request.app.state, "store")
+                    else ChromaDBStore(persist_directory=settings.vector_store_path)
                 )
-            )
-        except Exception:
-            # Never let an alert failure 500 the upload.
-            import logging
 
-            logging.getLogger(__name__).exception(
-                "Failed to schedule alert evaluation for document upload"
-            )
+                # `tmp_path` is only where the bytes live for extraction. Identity
+                # comes from `safe_filename` — the same key the destination path
+                # below, the listing, and DELETE all use — so a re-upload replaces
+                # this document instead of accumulating a second copy under a
+                # fresh temp name.
+                chunks_indexed = await ingest_file(
+                    path=tmp_path,
+                    store=store,
+                    domain=domain,
+                    collection=ChromaDBStore.COMPANY_COLLECTION,
+                    display_filename=safe_filename,
+                    document_id=company_document_id(safe_filename),
+                )
+
+                company_docs_dir = settings.company_profile_path.parent / "docs"
+                company_docs_dir.mkdir(parents=True, exist_ok=True)
+                dest = company_docs_dir / safe_filename
+                dest.write_bytes(content)
+
+                # Scheduling the alert belongs INSIDE the guard, not after it.
+                # `schedule_evaluation` detaches a task that LLM-triages the
+                # excerpt, writes an alert row into the episodic DB (per-client
+                # state that slots save and restore), and then dispatches it
+                # outbound to the live client's Slack/Discord/email. Scheduled
+                # after the guard released, a switch during triage would push a
+                # headline derived from THIS company's confidential document to
+                # ANOTHER company's channels and recipients — worse than the
+                # vector leak this slice closes, because it reaches humans.
+                #
+                # Inside the guard the scheduling decision is made under the same
+                # company that owns the document. The detached triage itself
+                # still runs later and is NOT guarded — recorded in
+                # `known_defects`, and a strictly smaller window than scheduling
+                # unconditionally.
+                _schedule_document_alert(
+                    ext=ext, content=content, safe_filename=safe_filename, domain=domain
+                )
+        except StaleCompanyContextError as exc:
+            # 409, not 500: nothing failed, the document simply no longer belongs
+            # to the company that is now live. Retrying is the user's call — this
+            # must never silently redirect their upload into another client.
+            # Nothing was written; the `finally` below still removes the temp file.
+            raise HTTPException(
+                status_code=409,
+                detail="Active company changed during upload. Please retry.",
+            ) from exc
 
     finally:
         tmp_path.unlink(missing_ok=True)

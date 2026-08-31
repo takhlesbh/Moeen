@@ -174,6 +174,57 @@ async def _get_client() -> Any | None:
             return None
 
 
+async def _get_client_for_workspace(workspace_id: str | None) -> Any | None:
+    """A client bound to ``workspace_id``, or the ambient client when None.
+
+    Exists because the cached client is keyed by event loop and rebuilt from
+    whatever workspace is active *at the moment of the cache miss*. A slot
+    switch calls ``set_active_workspace_id`` → ``_drop_cached_clients()``, so a
+    background task that reaches ``_get_client()`` after the switch constructs a
+    client bound to the NEW client's workspace and writes the previous client's
+    turn into it.
+
+    The Honcho client itself is safe once built: ``workspace_id`` is a
+    constructor argument and nothing re-reads the active workspace during the
+    SDK call (verified). So pinning the destination at schedule time is enough —
+    no lock is held across the remote write, and no Honcho redesign is needed.
+
+    Deliberately NOT cached: these are background-task clients for a specific
+    workspace, and caching them per (loop, workspace) would resurrect the same
+    staleness question for a marginal saving on an already-remote call.
+    """
+    if workspace_id is None:
+        return await _get_client()
+
+    # When the pinned workspace is still the active one, use the ordinary
+    # cached client. That keeps the common case on one code path (and keeps the
+    # per-loop cache meaningful); a fresh client is only built when the
+    # destination has genuinely diverged from the ambient state — i.e. after a
+    # switch, which is exactly when reusing the cache would be wrong.
+    if workspace_id == get_active_workspace_id():
+        return await _get_client()
+
+    settings = get_settings()
+    if not settings.honcho_enabled:
+        return None
+    if _current_loop() is None:
+        return None
+    try:
+        from honcho import Honcho
+
+        return Honcho(
+            api_key=settings.honcho_api_key,
+            base_url=settings.honcho_base_url,
+            workspace_id=workspace_id,
+            timeout=settings.honcho_prefetch_timeout_s,
+        )
+    except Exception:
+        logger.exception(
+            "honcho: client construction for pinned workspace failed"
+        )
+        return None
+
+
 def _drop_cached_clients() -> None:
     """Drop every cached client + lock + pending task across loops."""
     _clients.clear()
@@ -809,6 +860,13 @@ def sync_turn(
     # snapshot, every fire-and-forget audit row lands with
     # ``session_id=NULL`` and is invisible in the per-session audit view.
     audit_sid, audit_tid = get_active_ids()
+    # Pin the DESTINATION at schedule time, next to the audit snapshot and for
+    # the same reason: by the time this task runs, the ambient state it would
+    # otherwise read may belong to a different client. A slot switch calls
+    # `set_active_workspace_id`, which drops the client cache, so a task that
+    # reaches `_get_client()` afterwards builds a client bound to the NEW
+    # client's workspace and writes this turn into it.
+    origin_workspace = get_active_workspace_id()
     task = loop.create_task(
         _do_sync(
             user_message,
@@ -818,6 +876,7 @@ def sync_turn(
             co_present_snapshot,
             audit_sid,
             audit_tid,
+            workspace_id=origin_workspace,
         )
     )
     # Retain a strong reference so CPython doesn't GC the task before it
@@ -836,6 +895,7 @@ async def _do_sync(
     co_present_person_ids: list[int],
     audit_session_id: str | None,
     audit_turn_id: str | None,
+    workspace_id: str | None = None,
 ) -> None:
     # Re-bind the audit ContextVars from the snapshot taken at scheduling
     # time so ``_emit_peer_memory`` (which reads them via the audit logger
@@ -846,7 +906,7 @@ async def _do_sync(
     with set_turn(session_id=audit_session_id, turn_id=audit_turn_id):
         await _do_sync_body(
             user_message, assistant_response, person_id, session_id,
-            co_present_person_ids,
+            co_present_person_ids, workspace_id=workspace_id,
         )
 
 
@@ -856,9 +916,13 @@ async def _do_sync_body(
     person_id: int,
     session_id: str | None,
     co_present_person_ids: list[int],
+    workspace_id: str | None = None,
 ) -> None:
     t0 = time.monotonic()
-    client = await _get_client()
+    # Pinned at schedule time. Falling back to the ambient client would let a
+    # slot switch during this task redirect the write into the next client's
+    # workspace.
+    client = await _get_client_for_workspace(workspace_id)
     if client is None:
         _emit_peer_memory(op="sync_turn", person_id=person_id, outcome="error")
         return
@@ -1130,6 +1194,7 @@ def sync_department_turn(
     # for the rationale (the parent's set_turn block has already exited
     # by the time this background task runs).
     audit_sid, audit_tid = get_active_ids()
+    origin_workspace = get_active_workspace_id()
     task = loop.create_task(
         _do_sync_department(
             user_message,
@@ -1141,6 +1206,7 @@ def sync_department_turn(
             co_present_depts,
             audit_sid,
             audit_tid,
+            workspace_id=origin_workspace,
         )
     )
     _pending_sync_tasks.add(task)
@@ -1157,6 +1223,7 @@ async def _do_sync_department(
     co_present_department_slugs: list[str],
     audit_session_id: str | None,
     audit_turn_id: str | None,
+    workspace_id: str | None = None,
 ) -> None:
     # Re-bind the audit ContextVars so peer_memory rows we emit land
     # on the right session in the per-turn flow chart.
@@ -1164,7 +1231,7 @@ async def _do_sync_department(
         await _do_sync_department_body(
             user_message, assistant_response, department_slug, session_id,
             originating_person_id, co_present_person_ids,
-            co_present_department_slugs,
+            co_present_department_slugs, workspace_id=workspace_id,
         )
 
 
@@ -1176,9 +1243,11 @@ async def _do_sync_department_body(
     originating_person_id: int | None,
     co_present_person_ids: list[int],
     co_present_department_slugs: list[str],
+    workspace_id: str | None = None,
 ) -> None:
     t0 = time.monotonic()
-    client = await _get_client()
+    # Pinned at schedule time — see `_get_client_for_workspace`.
+    client = await _get_client_for_workspace(workspace_id)
     if client is None:
         _emit_peer_memory(
             op="sync_department_turn",
@@ -1344,9 +1413,11 @@ def append_department_note(
     # for rationale (parent's set_turn block has already exited by the
     # time this background task runs).
     audit_sid, audit_tid = get_active_ids()
+    origin_workspace = get_active_workspace_id()
     task = loop.create_task(
         _do_append_department_note(
             department_slug, kind, body, person_id, audit_sid, audit_tid,
+            workspace_id=origin_workspace,
         )
     )
     _pending_sync_tasks.add(task)
@@ -1360,12 +1431,13 @@ async def _do_append_department_note(
     person_id: int | None,
     audit_session_id: str | None,
     audit_turn_id: str | None,
+    workspace_id: str | None = None,
 ) -> None:
     # Re-bind the audit ContextVars so peer_memory rows we emit land on
     # the right session in the per-turn flow chart.
     with set_turn(session_id=audit_session_id, turn_id=audit_turn_id):
         await _do_append_department_note_body(
-            department_slug, kind, body, person_id,
+            department_slug, kind, body, person_id, workspace_id=workspace_id,
         )
 
 
@@ -1374,9 +1446,11 @@ async def _do_append_department_note_body(
     kind: NoteKind,
     body: str,
     person_id: int | None,
+    workspace_id: str | None = None,
 ) -> None:
     t0 = time.monotonic()
-    client = await _get_client()
+    # Pinned at schedule time — see `_get_client_for_workspace`.
+    client = await _get_client_for_workspace(workspace_id)
     if client is None:
         _emit_peer_memory(
             op="append_department_note",

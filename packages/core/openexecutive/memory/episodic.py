@@ -5,13 +5,18 @@ import logging
 import os
 import sqlite3
 import threading
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Generator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
+
+from openexecutive.clients.context_guard import StaleCompanyContextError
+
+if TYPE_CHECKING:
+    from openexecutive.clients.context_guard import CompanyContext
 
 logger = logging.getLogger(__name__)
 
@@ -1745,11 +1750,41 @@ _MAX_INPUT_CHARS = 20_000  # cap each side to avoid runaway cost
 MIN_TURN_CHARS_FOR_EXTRACTION = 1500
 
 
+@asynccontextmanager
+async def _episodic_commit_guard(
+    origin: CompanyContext | None, *, serialised: bool = True
+) -> AsyncIterator[None]:
+    """Serialise the episodic write block, or pass through with no origin.
+
+    Passthrough when `origin is None` keeps every pre-existing direct caller
+    (tests, CLI consolidation) behaving exactly as before.
+    """
+    if origin is None:
+        yield
+        return
+    from openexecutive.clients.context_guard import (
+        company_mutation_guard,
+        verify_company_context_unlocked,
+    )
+
+    if not serialised:
+        # Thread + asyncio.run fallback: a different event loop, where the
+        # shared lock cannot serialise. Verify without it rather than pretend.
+        verify_company_context_unlocked(origin, operation="episodic extraction")
+        yield
+        return
+    async with company_mutation_guard(origin, operation="episodic extraction"):
+        yield
+
+
 async def extract_and_store(
     user_message: str,
     assistant_response: str,
     db_path: Path = DB_PATH,
     session_id: str = "",
+    *,
+    origin: CompanyContext | None = None,
+    serialised: bool = True,
 ) -> None:
     """Extract memorable items from a conversation turn and persist them.
 
@@ -1799,76 +1834,92 @@ async def extract_and_store(
             ],
         )
 
-        for block in response.content:
-            if block.type != "tool_use" or block.name != "store_memories":
-                continue
+        # Everything below writes company-scoped rows into `db_path`, whose
+        # FILE a slot switch replaces. The LLM call above ran unguarded (it is
+        # slow and touches no company state); from here the writes are
+        # serialised against slot switches and rejected if the company moved.
+        # One guard for the whole block: decisions, initiatives and advice are
+        # a single turn's memory and must land together or not at all.
+        async with _episodic_commit_guard(origin, serialised=serialised):
+            for block in response.content:
+                if block.type != "tool_use" or block.name != "store_memories":
+                    continue
 
-            inp = block.input
-            # Validate every item against the user's actual text. The LLM has
-            # repeatedly proven willing to log the executive's recommendations
-            # as if the user had committed to them — see the May 27 incident
-            # where "Should we scope as fixed POC or hourly?" produced a
-            # decision "First $30K deal will be structured as fixed POC".
-            # The user_commitment_quote field + this validator are the
-            # hard gate that catches that pattern; the prompt is now just
-            # the soft instruction layer.
-            for d in inp.get("decisions", []):
-                domain = d.get("domain", "general")
-                summary = d.get("summary", "")
-                quote = d.get("user_commitment_quote", "")
-                if not summary:
-                    continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    logger.debug(
-                        "Dropping decision — invalid user_commitment_quote %r (summary=%r)",
-                        quote[:120],
-                        summary[:80],
+                inp = block.input
+                # Validate every item against the user's actual text. The LLM has
+                # repeatedly proven willing to log the executive's recommendations
+                # as if the user had committed to them — see the May 27 incident
+                # where "Should we scope as fixed POC or hourly?" produced a
+                # decision "First $30K deal will be structured as fixed POC".
+                # The user_commitment_quote field + this validator are the
+                # hard gate that catches that pattern; the prompt is now just
+                # the soft instruction layer.
+                for d in inp.get("decisions", []):
+                    domain = d.get("domain", "general")
+                    summary = d.get("summary", "")
+                    quote = d.get("user_commitment_quote", "")
+                    if not summary:
+                        continue
+                    if not _is_valid_user_commitment(quote, user_message):
+                        logger.debug(
+                            "Dropping decision — invalid user_commitment_quote %r (summary=%r)",
+                            quote[:120],
+                            summary[:80],
+                        )
+                        continue
+                    store_decision(
+                        domain=domain,
+                        summary=summary,
+                        rationale=d.get("rationale", ""),
+                        session_id=session_id,
+                        db_path=db_path,
                     )
-                    continue
-                store_decision(
-                    domain=domain,
-                    summary=summary,
-                    rationale=d.get("rationale", ""),
-                    session_id=session_id,
-                    db_path=db_path,
-                )
-            for i in inp.get("initiatives", []):
-                title = i.get("title", "")
-                status = i.get("status", "active")
-                summary = i.get("summary", "")
-                quote = i.get("user_commitment_quote", "")
-                if not (title and summary):
-                    continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    logger.debug(
-                        "Dropping initiative — invalid user_commitment_quote %r (title=%r)",
-                        quote[:120],
-                        title[:80],
+                for i in inp.get("initiatives", []):
+                    title = i.get("title", "")
+                    status = i.get("status", "active")
+                    summary = i.get("summary", "")
+                    quote = i.get("user_commitment_quote", "")
+                    if not (title and summary):
+                        continue
+                    if not _is_valid_user_commitment(quote, user_message):
+                        logger.debug(
+                            "Dropping initiative — invalid user_commitment_quote %r (title=%r)",
+                            quote[:120],
+                            title[:80],
+                        )
+                        continue
+                    store_initiative(title=title, status=status, summary=summary, db_path=db_path)
+                for a in inp.get("advice", []):
+                    domain = a.get("domain", "general")
+                    query_summary = a.get("query_summary", "")
+                    advice_summary = a.get("advice_summary", "")
+                    quote = a.get("user_commitment_quote", "")
+                    if not (query_summary and advice_summary):
+                        continue
+                    if not _is_valid_user_commitment(quote, user_message):
+                        logger.debug(
+                            "Dropping advice — invalid user_commitment_quote %r (query=%r)",
+                            quote[:120],
+                            query_summary[:80],
+                        )
+                        continue
+                    store_advice(
+                        domain=domain,
+                        query_summary=query_summary,
+                        advice_summary=advice_summary,
+                        session_id=session_id,
+                        db_path=db_path,
                     )
-                    continue
-                store_initiative(title=title, status=status, summary=summary, db_path=db_path)
-            for a in inp.get("advice", []):
-                domain = a.get("domain", "general")
-                query_summary = a.get("query_summary", "")
-                advice_summary = a.get("advice_summary", "")
-                quote = a.get("user_commitment_quote", "")
-                if not (query_summary and advice_summary):
-                    continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    logger.debug(
-                        "Dropping advice — invalid user_commitment_quote %r (query=%r)",
-                        quote[:120],
-                        query_summary[:80],
-                    )
-                    continue
-                store_advice(
-                    domain=domain,
-                    query_summary=query_summary,
-                    advice_summary=advice_summary,
-                    session_id=session_id,
-                    db_path=db_path,
-                )
 
+    except StaleCompanyContextError:
+        # Caught before the generic handler so a deliberate drop is not logged
+        # as a failure. Nothing is written, nothing is retried under the new
+        # company, and this turn's memory is NOT reinterpreted as belonging to
+        # whoever is now active.
+        logger.warning(
+            "Episodic extraction dropped — the company this turn belongs to is "
+            "no longer active"
+        )
     except Exception:
         logger.exception("Episodic memory extraction failed — skipping silently")
 
@@ -1883,10 +1934,19 @@ def schedule_extraction(
     Pass `session_id` to tag extracted decisions and advice with the
     originating conversation so format_for_prompt can scope them later.
     """
+    # Captured HERE, synchronously: `extract_and_store` awaits an LLM call
+    # before it writes, so a context read inside it would observe whichever
+    # company the switch landed on and authorise the write into it.
+    from openexecutive.clients.context_guard import capture_company_context
+
+    origin = capture_company_context()
     try:
         loop = asyncio.get_running_loop()
         task = loop.create_task(
-            extract_and_store(user_message, assistant_response, session_id=session_id)
+            extract_and_store(
+                user_message, assistant_response, session_id=session_id,
+                origin=origin,
+            )
         )
         # Hold a strong reference so GC cannot cancel the task mid-flight.
         _background_tasks.add(task)
@@ -1894,8 +1954,14 @@ def schedule_extraction(
     except RuntimeError:
         # No running event loop (CLI context) — run in a daemon thread.
         threading.Thread(
+            # Different event loop: the shared asyncio.Lock cannot serialise
+            # there, so the guard verifies without it. See
+            # `verify_company_context_unlocked`.
             target=lambda: asyncio.run(
-                extract_and_store(user_message, assistant_response, session_id=session_id)
+                extract_and_store(
+                    user_message, assistant_response, session_id=session_id,
+                    origin=origin, serialised=False,
+                )
             ),
             daemon=True,
         ).start()

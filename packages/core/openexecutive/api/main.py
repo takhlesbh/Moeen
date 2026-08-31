@@ -442,6 +442,16 @@ def create_app() -> FastAPI:
         for o in os.environ.get("BACKEND_ALLOWED_ORIGINS", "").split(",")
         if o.strip()
     ]
+    # Capture the active company BEFORE the request body is parsed. Registered
+    # here rather than in the route because FastAPI spools the whole multipart
+    # upload during dependency resolution, so a handler-level capture would run
+    # after the transfer — precisely the window a client switch lands in.
+    from openexecutive.clients.context_guard import (
+        install_company_context_middleware,
+    )
+
+    install_company_context_middleware(app)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", *extra_origins],

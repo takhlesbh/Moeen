@@ -159,10 +159,10 @@ async def test_run_persists_artifact_as_recent_research(
     async def fake_research_one(slug, agent, ctx):
         return [_finding()] if slug == "cso" else []
 
-    async def fake_synth(deduped):
+    async def fake_synth(deduped, *, origin=None):
         return ("ran", [])
 
-    async def fake_watchlist(findings, existing_watchlist):
+    async def fake_watchlist(findings, existing_watchlist, *, origin=None):
         return []
 
     monkeypatch.setattr(er, "research_one_specialist", fake_research_one)

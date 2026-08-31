@@ -195,7 +195,7 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
             )]
         return []
 
-    async def fake_synth(deduped):
+    async def fake_synth(deduped, *, origin=None):
         # One synthetic tool call to verify the result-event shape.
         return (
             "**Acted on:** DM principal about Acme funding.",
@@ -211,7 +211,7 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
         "openexecutive.workflows.executive_research.research_one_specialist",
         fake_research_one,
     )
-    async def fake_watchlist(findings, existing_watchlist):
+    async def fake_watchlist(findings, existing_watchlist, *, origin=None):
         return []
 
     monkeypatch.setattr(
@@ -266,7 +266,7 @@ async def test_workflow_skips_synthesis_when_no_findings(
 
     synth_calls = {"n": 0}
 
-    async def synth(deduped):
+    async def synth(deduped, *, origin=None):
         synth_calls["n"] += 1
         return ("", [])
 
@@ -322,7 +322,7 @@ async def test_workflow_drops_low_confidence_pre_synthesis(
 
     received_by_synth: list[ResearchFinding] = []
 
-    async def fake_synth(findings):
+    async def fake_synth(findings, *, origin=None):
         received_by_synth.extend(findings)
         return ("", [])
 
@@ -330,7 +330,7 @@ async def test_workflow_drops_low_confidence_pre_synthesis(
         "openexecutive.workflows.executive_research.research_one_specialist",
         fake_research_one,
     )
-    async def fake_watchlist(findings, existing_watchlist):
+    async def fake_watchlist(findings, existing_watchlist, *, origin=None):
         return []
 
     monkeypatch.setattr(
