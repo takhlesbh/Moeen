@@ -154,7 +154,27 @@ def _schedule_ingest(data: bytes, filename: str) -> None:
 
     Uses the same strong-ref pattern as ``_thread_rename_tasks`` in
     discord_bot to prevent GC cancellation mid-flight.
+
+    The company context is captured HERE, synchronously, before the task is
+    scheduled — this path is more exposed than the API upload, not less: the
+    task is detached, nothing awaits or cancels it, a slot switch does not wait
+    for it, and it can run arbitrarily later. Reading the context inside
+    ``_run`` would simply observe whichever company is active by then, which is
+    the bug rather than the fix.
     """
+    # Hoisted above `_run`'s try: binding `StaleCompanyContextError` inside the
+    # try would make it a function-local, so if that import itself ever failed
+    # (partial deploy, circular-import regression) the `except` clause would
+    # evaluate an unbound name and raise NameError *during* exception handling —
+    # escaping the generic handler and dying unhandled in a detached task.
+    from openexecutive.clients.context_guard import (
+        StaleCompanyContextError,
+        capture_company_context,
+        company_mutation_guard,
+    )
+
+    origin = capture_company_context()
+
     async def _run() -> None:
         suffix = _suffix_from_filename(filename)
         try:
@@ -186,13 +206,16 @@ def _schedule_ingest(data: bytes, filename: str) -> None:
                 # attachments have no stable logical handle here, so keying on
                 # the name would let two unrelated files called "notes.pdf"
                 # delete one another. Re-sending duplicates, as it does today.
-                count = await ingest_file(
-                    tmp_path,
-                    store,
-                    domain="company_docs",
-                    display_filename=filename,
-                    document_id=attachment_document_id(),
-                )
+                async with company_mutation_guard(
+                    origin, operation="attachment ingest"
+                ):
+                    count = await ingest_file(
+                        tmp_path,
+                        store,
+                        domain="company_docs",
+                        display_filename=filename,
+                        document_id=attachment_document_id(),
+                    )
                 logger.info(
                     "attachments: indexed %d chunks from %s into ChromaDB",
                     count,
@@ -200,6 +223,16 @@ def _schedule_ingest(data: bytes, filename: str) -> None:
                 )
             finally:
                 tmp_path.unlink(missing_ok=True)
+        except StaleCompanyContextError:
+            # Caught BEFORE the generic handler below so it is reported as what
+            # it is — a deliberate rejection, not an ingest failure. The
+            # attachment is dropped, never redirected into whichever company is
+            # now live, and never retried on its own.
+            logger.warning(
+                "attachments: dropped %s — the company that received it is no "
+                "longer active; not ingesting into the current company",
+                filename,
+            )
         except Exception:
             logger.exception("attachments: background ingest failed for %s", filename)
 
