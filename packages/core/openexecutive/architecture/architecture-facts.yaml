@@ -769,41 +769,41 @@ knowledge:
         `origin_company_context` is keyword-only and defaults to `None`, so
         `executive_reflection` and every other caller are unaffected.
 
-    WHAT IS NOT COVERED — see `known_defects`. The guarantee is "these paths",
-    not "company isolation is closed".
+      - `memory/episodic.schedule_extraction` — fires on EVERY chat turn.
+        Captures synchronously, awaits the LLM extraction OUTSIDE the lock, then
+        wraps the whole write block (decisions, initiatives, advice) in ONE
+        guard: they are a single turn's memory and must land together or not at
+        all. A stale turn is dropped, never reinterpreted as the new company's.
+      - `memory/honcho_client` `sync_turn` / `sync_department_turn` /
+        `append_department_note` — a different resource, so a different fix.
+        These write to a remote Honcho WORKSPACE, and `_get_client()` resolves
+        `get_active_workspace_id()` at the moment of a cache miss; a slot switch
+        calls `set_active_workspace_id`, which DROPS the client cache, so a task
+        reaching the factory after the switch builds a client bound to the next
+        client's workspace. The Honcho client is otherwise safe — `workspace_id`
+        is a constructor argument and nothing re-reads it during the SDK call —
+        so the destination is pinned at schedule time and passed explicitly
+        (`_get_client_for_workspace`). No lock is held across the remote write,
+        and when the pinned workspace still matches the live one the ordinary
+        cached client is used.
+
+    WHAT IS NOT COVERED — see `known_defects`. The guarantee is bounded to the
+    audited Pilot paths in a single process; it is not "company isolation is
+    closed" as a global property.
 
     **SINGLE-PROCESS GUARANTEE ONLY.** `asyncio.Lock` is process-local, so this
     does NOT protect against a second uvicorn worker, a CLI run, or any other
     process sharing `vector_store_path`. See `known_defects`.
   known_defects: |
-    EPISODIC MEMORY EXTRACTION CROSSES COMPANIES — OPEN, and the reason company
-    isolation is NOT closed. `memory/episodic.schedule_extraction` detaches
-    `extract_and_store`, which `await`s an LLM extraction call and only then
-    calls `store_decision(..., db_path=DB_PATH)` / the initiative writes.
-    `DB_PATH` is a module-level default bound at import — the same fixed path
-    whose FILE the slot switch swaps — so a switch during the extraction await
-    lands client A's conversation-derived decisions and initiatives in client
-    B's episodic DB, from where `format_for_prompt` feeds them into B's
-    Executive prompt.
-
-    Fires from `Executive.chat` / `stream_chat`, i.e. EVERY chat turn — which
-    includes the web-chat multipart attachment path inside the audited scope.
-
-    Smallest seam: the same capture-then-guard shape — `schedule_extraction`
-    captures a `CompanyContext` and `extract_and_store` verifies it under
-    `company_mutation_guard` around the store writes.
-
-    STRUCTURAL NOTE: this is the fourth instance of one pattern — a detached
-    task that awaits an LLM and then writes company-scoped state through a fixed
-    path whose contents the slot switch replaces. Guarding them one at a time
-    has not converged. The durable fix is a shared "company-bound background
-    task" helper that captures at schedule time and guards at commit, applied
-    once at the `create_task`/thread boundary, rather than a fifth bespoke seam.
-
-    OUTBOUND TOOL CALLS DURING LLM LOOPS — CLOSED for the research loops (see
-    `company_isolation`). Recorded here for history: they execute BETWEEN
-    provider awaits, so a commit-boundary guard could not cover them; the fix
-    was a per-call guard inside `execute_tool_calls`.
+    AUDITED PILOT BACKGROUND TASKS ARE CLOSED — within a single process. Every
+    detached task reachable from the normal Pilot paths (Executive.chat /
+    stream_chat, document upload, chat attachments, alert pipeline, executive
+    research, monitoring alert scheduling) now captures its company context at
+    SCHEDULE time and verifies at COMMIT time: alert triage, research
+    persistence, research per-call tools, episodic extraction, and the three
+    Honcho syncs. That is the audited inventory, not a claim about the whole
+    repository — CLI, eval and admin paths were explicitly out of scope, and
+    nothing here makes company isolation a global property.
 
     (Historic, now closed — retained so the reasoning is not lost:)
 

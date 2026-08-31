@@ -1768,3 +1768,360 @@ def test_reflection_caller_passes_no_origin_and_is_unguarded() -> None:
         / "openexecutive" / "workflows" / "executive_reflection.py"
     ).read_text()
     assert "origin_company_context" not in source
+
+
+# ---------------------------------------------------------------------------
+# B1 — episodic memory extraction (every chat turn).
+# ---------------------------------------------------------------------------
+
+
+def _episodic_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_llm: Any = None
+) -> dict[str, Any]:
+    """Drive extract_and_store with a barrier-controlled fake LLM."""
+    from openexecutive.memory import episodic as ep
+
+    db = tmp_path / "episodic.db"
+    ep.initialize_db(db_path=db)
+
+    class _Block:
+        type = "tool_use"
+        name = "store_memories"
+        input = {
+            "decisions": [{
+                "domain": "finance", "summary": "A-CONFIDENTIAL decision",
+                "rationale": "r", "user_commitment_quote": "we will do it",
+            }],
+        }
+
+    class _Resp:
+        content = [_Block()]
+
+    class _Provider:
+        async def messages_create(self, **kwargs: Any) -> Any:
+            if on_llm is not None:
+                await on_llm()
+            return _Resp()
+
+    monkeypatch.setattr(
+        "openexecutive.providers.get_provider", lambda *_a, **_k: _Provider()
+    )
+    monkeypatch.setattr(ep, "_is_valid_user_commitment", lambda *a, **k: True)
+    return {"db": db, "ep": ep}
+
+
+def test_episodic_extraction_after_switch_writes_nothing_into_b(
+    company_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1-A: the disclosure — A's decision must not land in B's memory."""
+    set_active_client(company_root, "acme")
+    origin = capture_company_context()
+
+    async def switch() -> None:
+        set_active_client(company_root, "globex")
+
+    env = _episodic_env(tmp_path, monkeypatch, on_llm=switch)
+    ep = env["ep"]
+
+    asyncio.run(ep.extract_and_store(
+        "we will do it", "ok", db_path=env["db"], session_id="s1", origin=origin
+    ))
+
+    assert ep.get_recent_decisions(db_path=env["db"]) == []
+
+
+def test_episodic_extraction_same_company_still_stores(
+    company_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1-B: baseline behaviour preserved."""
+    set_active_client(company_root, "acme")
+    origin = capture_company_context()
+    env = _episodic_env(tmp_path, monkeypatch)
+    ep = env["ep"]
+
+    asyncio.run(ep.extract_and_store(
+        "we will do it", "ok", db_path=env["db"], session_id="s1", origin=origin
+    ))
+
+    rows = ep.get_recent_decisions(db_path=env["db"])
+    assert len(rows) == 1
+    assert "A-CONFIDENTIAL" in rows[0].summary
+
+
+@pytest.mark.parametrize("start,switch", [("acme", None), (None, "globex")])
+def test_episodic_none_transitions_reject(
+    company_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    start: str | None, switch: str | None,
+) -> None:
+    """B1-C and B1-D."""
+    set_active_client(company_root, start)
+    origin = capture_company_context()
+
+    async def do_switch() -> None:
+        set_active_client(company_root, switch)
+
+    env = _episodic_env(tmp_path, monkeypatch, on_llm=do_switch)
+    ep = env["ep"]
+    asyncio.run(ep.extract_and_store(
+        "we will do it", "ok", db_path=env["db"], session_id="s1", origin=origin
+    ))
+    assert ep.get_recent_decisions(db_path=env["db"]) == []
+
+
+def test_format_for_prompt_for_b_cannot_see_rejected_a_memory(
+    company_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1-J: the end-to-end consequence — B's prompt must not contain A's memory."""
+    set_active_client(company_root, "acme")
+    origin = capture_company_context()
+
+    async def switch() -> None:
+        set_active_client(company_root, "globex")
+
+    env = _episodic_env(tmp_path, monkeypatch, on_llm=switch)
+    ep = env["ep"]
+    asyncio.run(ep.extract_and_store(
+        "we will do it", "ok", db_path=env["db"], session_id="s1", origin=origin
+    ))
+
+    block = ep.format_for_prompt(db_path=env["db"])
+    assert "A-CONFIDENTIAL" not in block
+
+
+def test_episodic_switch_waits_for_an_in_flight_commit(
+    company_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1-E: a switch during the protected commit queues on the lock."""
+    from openexecutive.cli.fixture_loader import _FIXTURE_OP_LOCK
+    from openexecutive.memory import episodic as ep
+
+    set_active_client(company_root, "acme")
+    origin = capture_company_context()
+    env = _episodic_env(tmp_path, monkeypatch)
+
+    in_commit = asyncio.Event()
+    order: list[str] = []
+    real_store = ep.store_decision
+
+    def slow_store(**kwargs: Any) -> Any:
+        in_commit.set()
+        order.append("write")
+        return real_store(**kwargs)
+
+    monkeypatch.setattr(ep, "store_decision", slow_store)
+
+    async def rotation() -> None:
+        await in_commit.wait()
+        async with _FIXTURE_OP_LOCK:
+            order.append("switch")
+
+    async def both() -> Any:
+        return await asyncio.gather(
+            ep.extract_and_store(
+                "we will do it", "ok", db_path=env["db"], origin=origin
+            ),
+            rotation(),
+        )
+
+    asyncio.run(asyncio.wait_for(both(), timeout=5))
+    assert order == ["write", "switch"], f"switch interleaved: {order}"
+
+
+def test_episodic_exception_and_cancellation_release_the_lock(
+    company_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1-F and B1-G."""
+    from openexecutive.cli.fixture_loader import _FIXTURE_OP_LOCK
+    from openexecutive.memory import episodic as ep
+
+    set_active_client(company_root, "acme")
+    origin = capture_company_context()
+    env = _episodic_env(tmp_path, monkeypatch)
+
+    def boom(**kwargs: Any) -> Any:
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(ep, "store_decision", boom)
+    # extract_and_store swallows generic exceptions by contract; the lock must
+    # still be released on the way out.
+    asyncio.run(ep.extract_and_store(
+        "we will do it", "ok", db_path=env["db"], origin=origin
+    ))
+    assert not _FIXTURE_OP_LOCK.locked()
+
+
+def test_episodic_mutation_no_origin_reproduces_the_leak(
+    company_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1-H."""
+    set_active_client(company_root, "acme")
+
+    async def switch() -> None:
+        set_active_client(company_root, "globex")
+
+    env = _episodic_env(tmp_path, monkeypatch, on_llm=switch)
+    ep = env["ep"]
+    asyncio.run(ep.extract_and_store(
+        "we will do it", "ok", db_path=env["db"], origin=None
+    ))
+    assert ep.get_recent_decisions(db_path=env["db"]), (
+        "unguarded path should have leaked — the mutation is inert"
+    )
+
+
+def test_episodic_mutation_late_capture_defeats_the_guard(
+    company_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1-I: capture after the LLM await observes B and passes."""
+    set_active_client(company_root, "acme")
+    set_active_client(company_root, "globex")
+    late_origin = capture_company_context()
+
+    env = _episodic_env(tmp_path, monkeypatch)
+    ep = env["ep"]
+    asyncio.run(ep.extract_and_store(
+        "we will do it", "ok", db_path=env["db"], origin=late_origin
+    ))
+    assert ep.get_recent_decisions(db_path=env["db"]), (
+        "late capture should pass — proving schedule-time capture is the protection"
+    )
+
+
+def test_schedule_extraction_captures_origin_at_schedule_time(
+    company_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1: propagation from the sync scheduler into the detached task."""
+    from openexecutive.memory import episodic as ep
+
+    set_active_client(company_root, "acme")
+    seen: dict[str, Any] = {}
+
+    async def fake_extract(*a: Any, **kwargs: Any) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(ep, "extract_and_store", fake_extract)
+
+    async def run() -> None:
+        ep.schedule_extraction("u", "a", session_id="s")
+        set_active_client(company_root, "globex")
+        await asyncio.gather(*list(ep._background_tasks))
+
+    asyncio.run(run())
+    assert seen["origin"].client == "acme"
+
+
+# ---------------------------------------------------------------------------
+# B2–B4 — Honcho writes are pinned to the originating workspace.
+# ---------------------------------------------------------------------------
+
+
+def test_honcho_client_is_pinned_to_the_origin_workspace(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2-E/B3-E/B4-E: the destination is the ORIGIN workspace, not the live one."""
+    from openexecutive.memory import honcho_client as hc
+
+    built: list[str] = []
+
+    class FakeHoncho:
+        def __init__(self, **kwargs: Any) -> None:
+            built.append(kwargs["workspace_id"])
+
+    monkeypatch.setattr(hc, "get_active_workspace_id", lambda: "ws-CLIENT-B")
+    monkeypatch.setitem(__import__("sys").modules, "honcho",
+                        type("m", (), {"Honcho": FakeHoncho}))
+    monkeypatch.setattr(hc, "_current_loop", lambda: object())
+
+    settings = hc.get_settings()
+    monkeypatch.setattr(hc, "get_settings", lambda: type(
+        "S", (), {"honcho_enabled": True, "honcho_api_key": "k",
+                  "honcho_base_url": "u", "honcho_prefetch_timeout_s": 1,
+                  "honcho_workspace_id": "ws-CLIENT-B"})())
+
+    asyncio.run(hc._get_client_for_workspace("ws-CLIENT-A"))
+    assert built == ["ws-CLIENT-A"], (
+        f"write would have gone to the live workspace, not the origin: {built}"
+    )
+    assert settings is not None
+
+
+@pytest.mark.parametrize(
+    "fn,kwargs",
+    [
+        ("sync_turn", {"person_id": 1, "session_id": "s"}),
+        ("sync_department_turn", {"department_slug": "eng", "session_id": "s"}),
+        ("append_department_note",
+         {"department_slug": "eng", "kind": "decision", "body": "b"}),
+    ],
+)
+def test_honcho_helpers_capture_workspace_at_schedule_time(
+    monkeypatch: pytest.MonkeyPatch, fn: str, kwargs: dict[str, Any]
+) -> None:
+    """B2/B3/B4-A: the workspace is pinned before the switch can move it."""
+    from openexecutive.memory import honcho_client as hc
+
+    workspaces: list[str | None] = []
+    live = {"ws": "ws-CLIENT-A"}
+
+    monkeypatch.setattr(hc, "get_active_workspace_id", lambda: live["ws"])
+
+    async def fake_client(workspace_id: str | None) -> Any:
+        # Resolved when the detached task RUNS — after the switch below.
+        workspaces.append(workspace_id)
+        return None
+
+    monkeypatch.setattr(hc, "_get_client_for_workspace", fake_client)
+    monkeypatch.setattr(
+        hc, "get_settings",
+        lambda: type("S", (), {"honcho_enabled": True, "honcho_api_key": "k",
+                               "honcho_base_url": "u",
+                               "honcho_prefetch_timeout_s": 1})(),
+    )
+
+    async def run() -> None:
+        if fn == "append_department_note":
+            getattr(hc, fn)(**kwargs)
+        else:
+            getattr(hc, fn)("u", "a", **kwargs)
+        live["ws"] = "ws-CLIENT-B"          # slot switch lands here
+        await asyncio.gather(*list(hc._pending_sync_tasks), return_exceptions=True)
+
+    asyncio.run(run())
+
+    assert workspaces, f"{fn} never reached the client factory"
+    assert workspaces[0] == "ws-CLIENT-A", (
+        f"{fn} resolved the post-switch workspace {workspaces[0]!r}"
+    )
+
+
+def test_honcho_mutation_late_workspace_resolution_reproduces_the_bug(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2-F: resolving at run time yields B — which is the defect."""
+    from openexecutive.memory import honcho_client as hc
+
+    live = {"ws": "ws-CLIENT-A"}
+    monkeypatch.setattr(hc, "get_active_workspace_id", lambda: live["ws"])
+
+    async def run() -> str:
+        live["ws"] = "ws-CLIENT-B"           # switch during the "await"
+        return hc.get_active_workspace_id()  # MUTATION: late resolution
+
+    assert asyncio.run(run()) == "ws-CLIENT-B"
+
+
+def test_honcho_uses_cached_client_when_workspace_unchanged(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The common case must stay on the ordinary cached path."""
+    from openexecutive.memory import honcho_client as hc
+
+    monkeypatch.setattr(hc, "get_active_workspace_id", lambda: "ws-SAME")
+    sentinel = object()
+
+    async def fake_get_client() -> Any:
+        return sentinel
+
+    monkeypatch.setattr(hc, "_get_client", fake_get_client)
+    assert asyncio.run(hc._get_client_for_workspace("ws-SAME")) is sentinel
+    assert asyncio.run(hc._get_client_for_workspace(None)) is sentinel
