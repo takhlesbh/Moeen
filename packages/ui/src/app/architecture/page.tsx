@@ -35,6 +35,7 @@ const SECTIONS = [
   { id: 'talent', label: 'Talent / Executive Search', sub: 'The in-house hiring vertical: engagements (searches), candidates, the ChromaDB matching graph, and the draft-and-approve recruiting workflows — surfaced in the /talent UI.' },
   { id: 'staff_onboarding', label: 'Staff Onboarding', sub: 'Role-tailored onboarding for new hires: reusable templates, per-hire plans with phased task checklists, the role_onboarding brief workflow, a bounded ramp drip, and chat + /today integration.' },
   { id: 'clients', label: 'Client Companies (Slots)', sub: 'Multi-client mode for fractional executives: named save files of the full company context, one active at a time, with save-back switching and per-client MCP tool configs.' },
+  { id: 'calc', label: 'Deterministic Calculation Contracts', sub: 'Typed calculation request/result contracts, a closed unit registry with exact factors, and the authority boundary that keeps a model from calling its own arithmetic verified. Contracts only — no engine yet.' },
 ];
 
 interface SectionMeta {

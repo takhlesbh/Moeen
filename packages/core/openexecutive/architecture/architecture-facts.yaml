@@ -3205,6 +3205,294 @@ clients:
     active card is always live-fresh; parked staleness is inherent until
     the v2 overnight-rotation phase.
 
+calc:
+  module: openexecutive.calc
+  status: |
+    CONTRACTS ONLY. No arithmetic engine exists and NO production module
+    imports this package. A test asserts both. Phase 2 adds the engine.
+  intent: |
+    Deterministic calculation foundation. A controlled single-specialist
+    evaluation measured the CFO on three reconciliation checks with all
+    required evidence verified visible in its context; it scored 0/5, 1/5 and
+    0/5. The model identified the correct operands and formula (52 kg/m2,
+    11 ha = 110,000 m2, "yield per m2 x area") and returned a result off by a
+    factor of ten; another calculation came back carrying the placeholder XX.
+    A prompt-only fix was implemented, measured and REJECTED: it removed
+    placeholders and stopped unverified figures being used as covenant
+    premises, but produced three new fabricated magnitudes. Arithmetic
+    execution therefore moves to deterministic code, and the record must keep
+    four things apart: what the model proposed, what an engine computed,
+    whether inputs were evidence-backed, and whether the result conflicts with
+    the applicant's stated figure.
+  ownership: |
+    Application-owned. The model proposes calculations; it never executes them
+    and never assigns verification status.
+  dependencies_allowed: |
+    json, re, decimal, types (MappingProxyType), typing, collections.abc
+    (Mapping), pydantic, and openexecutive.calc itself. Nothing else.
+  dependencies_forbidden: |
+    agents, specialists, providers, orchestrator, prompts, memory, api,
+    workflows, knowledge. `calc` is a LEAF package -- that is what lets the
+    future engine be tested with no fixtures, no mocks and no model. Enforced
+    by test_calc_contract_foundation.py.
+  no_execution_authority: |
+    No filesystem, network, or code-execution authority. Two AST-based tests, both run over
+    every .py file found ON DISK under the package directory (os.walk +
+    read_text + ast.parse), plus tests asserting the file set is exactly the six known
+    modules and that no .py hides in a subdirectory (__pycache__ included).
+    THREE adversarial rounds produced that shape, each breaking a narrower
+    version:
+      round 1 -- a hand-written module tuple omitted _model.py and __init__.py;
+        a subprocess backdoor appended to _model.py passed the whole suite.
+      round 2 -- pkgutil.iter_modules is not recursive, so calc/sub/evil.py
+        still escaped; a directory without __init__.py is importable as a
+        namespace package.
+      round 3 -- inspect.getsource resolves a module's LIVE __file__, so a
+        module that rebinds __file__ at import time was scanned as some other
+        file. A backdoor.py importing subprocess/socket/pickle and reading .env
+        passed 175/175.
+      round 4 -- the fix moved the hole one line up: the scan ROOT was still
+        pathlib.Path(units_mod.__file__).parent, so a units.py that rebound
+        __file__ redirected the whole walk to a decoy tree of clean copies and
+        passed 197/197 while running a subprocess at import time. Also:
+        a default tree walk does NOT descend into symlinked directories, so
+        `ln -s /elsewhere calc/sub` fully restored the round-2 escape (and git
+        tracks symlinks); a sourceless .pyc imports but never matches a *.py
+        glob; and ast.ImportFrom for `from .. import providers` has module=None,
+        so recording only node.module skipped the node and walked past the
+        allowlist, the leaf rule and the execution scan at once.
+      round 5 -- the symlink fix used Path.rglob(recurse_symlinks=True), which
+        is PYTHON 3.13 ONLY while this project targets 3.11 (requires-python,
+        ruff target-version, mypy python_version, CI, and the Dockerfile all say
+        3.11). Every scanner test raised TypeError on the shipped interpreter:
+        the guarantee did not run anywhere the project ships. Replaced with
+        os.walk, which does not follow symlinks by default -- correct here,
+        since symlinks are REJECTED rather than traversed, which also removes
+        the cycle-guard question. Round 5 also found the production-import test
+        was a two-literal substring grep and missed `from ..calc import Unit`;
+        it now parses imports the same way the in-package scan does.
+    The checks:
+      1. an import allowlist -- only json, re, decimal, types, typing,
+         collections.abc, pydantic and openexecutive.calc itself. The prefix is
+         openexecutive.calc, NOT openexecutive, so the allowlist and the
+         leaf-package rule are the same check and a subpackage added later
+         cannot slip through.
+      2. a called-name scan for invoked builtins (eval, exec, compile, open,
+         globals, getattr, ...) and dangerous attribute calls (system, popen,
+         literal_eval, hexdigest, urlopen, ...). NOTE: subprocess, importlib,
+         socket and pickle are caught by check 1, not by this one -- the two
+         are complementary and neither is sufficient alone.
+    SCOPE, STATED HONESTLY: these catch DIRECT imports and DIRECT calls. They do
+    NOT catch indirection -- an aliased builtin, a subscript call on
+    __builtins__, a dunder lookup, or a mechanism reached through a dependency.
+    Those are not statically decidable in general; the real defence is the
+    import allowlist plus review. Treat the scan as a regression guard on the
+    obvious forms, not a proof of safety.
+  files: |
+    calc/_model.py     frozen, revalidating ContractModel base (deliberately
+                       mirrors specialists.result_contract._ContractModel
+                       rather than importing a private cross-package name)
+    calc/units.py      closed unit registry, dimensions, exact Decimal factors,
+                       type predicates. NO conversion, NO dimensional arithmetic
+    calc/numeric.py    the numeric boundary: float rejected, ambiguous
+                       separators rejected, NaN/Inf/exponent/length bounds
+    calc/contract.py   CalculationRequest/Result, statuses, fingerprint payload
+    calc/authority.py  current_authority() + issue_calculation_result()
+  two_status_axes: |
+    arithmetic_status  -- did an engine execute the expression?
+    evidence.status    -- were the operands backed?
+    Never merged. ARITHMETIC_VERIFIED + UNSUPPORTED is a legal, tested state:
+    correct arithmetic over unsupported inputs is still unsupported investment
+    evidence. is_verified_evidence() is the ONLY place the conjunction is
+    expressed, so the strong claim must be asked for by name. InputEvidenceSummary
+    carries a coherence validator so that claim cannot be forged by a partial
+    evidence layer: ALL_SUPPORTED alongside any unbound operand is refused,
+    ALL_SUPPORTED with an EMPTY bound list is refused (the zero-argument default
+    is exactly what a partial evidence layer produces, and round 2 proved it
+    reached is_verified_evidence() == True with nothing confirmed), UNSUPPORTED
+    with a bound operand is refused, PARTIALLY_SUPPORTED requires one of each,
+    EVIDENCE_UNAVAILABLE may list no bindings, an operand cannot be both bound
+    and unbound, duplicates are refused, and the result cross-checks every named
+    id against the operands it actually records -- ALL_SUPPORTED requires the
+    bound set to EQUAL the recorded operand set.
+    CONFLICT_DETECTED is deliberately NOT an arithmetic status -- it lives on an
+    orthogonal `conflict` axis (with ORDER_OF_MAGNITUDE, the class describing a
+    stated 572 t against a computed 5,720 t) because a result is frequently
+    verified AND conflicting, and one enum cannot carry both facts.
+  authority_boundary: |
+    Against the MODEL -- structural. A model speaks only through
+    CalculationRequest, which has no field for an arithmetic status, evidence
+    status, authority stamp, fingerprint, timestamp, or trusted source
+    location; extra="forbid" means an attempt is REJECTED, not silently
+    stripped. Same guarantee specialists.result_contract relies on for
+    verified_result.
+    Against a SAME-PROCESS CALLER -- conventional, not absolute. Python has no
+    private constructor; model_construct and object.__setattr__ bypass pydantic
+    for any model. issue_calculation_result() is one named, greppable channel
+    that fills the authority stamp from a module constant rather than a caller
+    argument. A convention with teeth, NOT a security boundary. Do not
+    overclaim this.
+  source_hint_not_evidence_ref: |
+    SourceHint is a deliberate non-reuse of EvidenceRef. EvidenceRef carries
+    page/sheet/cell_range/url/retrieved_at, safe there only because
+    parse_specialist_result strips them via _MODEL_FORBIDDEN_EVIDENCE_FIELDS --
+    the TYPE permits them. Embedding it in a model-authored request would let
+    any other deserialization path carry a model-asserted spreadsheet cell
+    through as confirmed provenance. SourceHint has no field in which to assert
+    one; its retrieval_id_hint is named for what it is and never becomes a
+    validated retrieval_id.
+  units_policy: |
+    Closed registry, exact Decimal factors, no implicit guessing, unknown unit
+    is a validation error. pct and pct_point are different DIMENSIONS, so
+    comparing a margin against a percentage-point gap is a type error.
+    ha -> m2 is exactly 10000; t -> kg exactly 1000. month <-> year shares a
+    dimension but is marked explicit_required (a month is not 1/12 of a
+    financial year under every day-count basis). kg_per_m2 composes with area
+    to give mass. Currency is written currency:XXX with an ISO-SHAPED code,
+    never a bare TND; cross-currency comparison is refused because Version 1
+    ships no exchange-rate authority.
+  decimal_policy: |
+    Values enter as canonical strings. float is REJECTED with an explicit
+    error, never coerced; bool and externally-built Decimal are rejected too;
+    int is accepted under a documented lossless policy. NaN, Infinity, empty,
+    surrounding whitespace, |adjusted exponent| > 30 and literals over 64 chars
+    all fail closed. Separators are never inferred: plain format forbids
+    commas, comma_thousands must be requested by name, decimal commas are
+    rejected as ambiguous. NumberFormat is a closed enum, not a locale name.
+    Canonical form is scale-preserving: 1.50 and 1.5 differ, because a figure
+    stated to two decimal places is not the same evidence as one stated to one.
+  v1_operations: |
+    add, subtract, multiply, divide, sum_components, percentage_of,
+    percentage_point_difference, ratio, weighted_average, variance,
+    convert_unit, interval_implied_total. DECLARED, NOT IMPLEMENTED.
+    Absent on purpose: IRR, XIRR, NPV, CAGR, debt schedules, sensitivity
+    tables -- each needs a cash-flow SERIES contract (timing, periodicity, day
+    count) the scalar operand model does not carry, and none is needed by the
+    measured failures. A closed typed-operation API was chosen over a parsed
+    expression grammar: a grammar buys arbitrary formulas Version 1 does not
+    want, in exchange for the only meaningful code-execution surface here.
+  limits: |
+    64 operands/request, 32 requests/batch, 64 chars/numeric literal,
+    2048 chars/expression, precision request 50, |adjusted exponent| 30,
+    scale 0..28, nesting depth 0 (operations do not nest, which removes
+    recursion as a category rather than bounding it). Timeouts belong to the
+    Phase 2 engine, not the contract.
+  fingerprint: |
+    Phase 1 defines the PAYLOAD and pins it with tests; the digest is Phase 2's
+    (no canonical-hash utility exists here to reuse). Identity is "what was
+    computed", not "who asked or when".
+    INCLUDES schema_version, operation, ordered normalized operands + units,
+    target unit, scale, rounding, applicant stated_value, authority id and
+    version.
+    EXCLUDES request_id, case_id, run_id, specialist, claim_id, timestamps,
+    purpose/label prose, display formatting, warnings -- so the same
+    reconciliation in two cases fingerprints identically.
+    Operand order is preserved for EVERY operation, commutative ones included:
+    labels and provenance ride with position, so reordering would silently
+    re-pair a value with another operand's label.
+  invariants: |
+    - No arithmetic anywhere in the package (a test traps decimal Inexact and
+      Rounded while exercising the whole contract surface).
+    - No production caller (a test PARSES the imports of every module under
+      packages/core/openexecutive/, packages/core/scripts/ and evals/, excluding
+      tests -- grepping missed `from ..calc import Unit`).
+    - The model cannot assign verification, authority, fingerprint, timestamp
+      or trusted source location -- no field exists for it.
+    - ARITHMETIC_VERIFIED requires expression_executed + result_value +
+      result_unit and forbids errors; a non-verified status must not carry a
+      result_value; a conflict class requires the stated_value it conflicts
+      with.
+    - The specialist result contract's CalculationProvenance is UNCHANGED in
+      this phase: its verification guard is not relaxed and no sanctioned
+      verified constructor is added. A test asserts it still refuses.
+    - A failure status may not carry ANY field asserting the work succeeded --
+      not result_value, exact_result, expression_executed, result_unit,
+      scale/rounding applied, any difference or ratio, or a conflict class.
+    - Result-side collections are bounded: normalized operands and evidence id
+      tuples capped at 64, id and warning lengths bounded. A maximal result
+      serializes to ~100 KB. An unbounded durable record is a self-inflicted DoS
+      on the persistence and review path. The REQUEST side is looser -- a
+      maximal 32x64 CalculationBatch is ~2.3 MB -- bounded but not tight; not
+      model-reachable in practice, and a Phase 2 concern for queue replay rather
+      than a Phase 1 defect.
+    - EVERY result-side numeric field (result_value, exact_result, stated_value,
+      the differences, ratio, and both NormalizedOperand values) goes through the
+      same parse_numeric boundary as an operand. Round 2 proved that without it,
+      result_value="XX" was a legal ARITHMETIC_VERIFIED record that reached
+      is_verified_evidence() and the fingerprint payload -- XX being one of the
+      two measured failures this package exists to prevent. Prose fields
+      (expression_executed, warnings, error detail, conversion_applied, note)
+      remain free text by design, bounded in length rather than shape.
+    - normalized_operands may not contain duplicate operand_ids: a request
+      enforces uniqueness, and duplicates would let one evidence binding satisfy
+      the "every recorded operand is bound" check for two different values.
+    - A NormalizedOperand's original and normalized units must describe a
+      conversion that could actually happen (units.convertible, a pure
+      predicate). Without it, "11 hectares normalised to 11 dinars, no
+      conversion applied" was a legal record -- the dimension predicates existed
+      but nothing called them. A same-unit normalisation may not change the
+      value.
+    - computed_at must be an ISO-8601 UTC instant (shape only -- the contract
+      cannot know whether a clock was right).
+    - authority_id must be a member of KNOWN_AUTHORITY_IDS, closing the ordinary
+      model_validate path (queue replay, DB load) against a free-text authority.
+      This does not make the stamp unforgeable; nothing in Python can.
+    - Currency and numeric regexes are anchored \\A..\\Z, not ^..$, because $
+      also matches before a terminal newline: "currency:TND\\n" validated and
+      would have been a second Unit.code for one currency. Numeric literals use
+      [0-9], not \\d, which is Unicode-aware.
+    - A single operand's own original_unit -> normalized_unit step must be a
+      conversion that could actually happen (units.convertible), and a
+      month<->year step must state its basis in conversion_applied. That is the
+      part needing no operation semantics.
+      NOT enforced here, deliberately: per-operation dimensional signatures
+      (which operations need compatible inputs, what multiply composes to,
+      what divide yields). A draft encoded them and it was removed -- it is
+      outside this phase's scope ("define the types and registry required for
+      the later engine", not implement dimensional arithmetic) and it was wrong
+      in the way that scope exists to prevent: getting `divide` wrong made the
+      package REJECT its own motivating calculation, 5,720,000 kg / 110,000 m2
+      = 52 kg/m2. Six review findings in one round traced to that table, three
+      of them holes it opened. The engine that knows what each operation MEANS
+      applies the predicates, and arrives with its own arity declarations.
+    - authority_version, not just authority_id, must be a known value. It is a
+      fingerprint identity field, so free text let a replayed contract-phase
+      result be re-stamped as engine-phase through the ordinary model_validate
+      path. Phase 2 adds its engine version to KNOWN_AUTHORITY_VERSIONS in the
+      same commit that adds the engine.
+    - A conversion whose dimension is explicit_required (month<->year) must
+      populate conversion_applied stating the basis; UnitSpec rejects a float
+      factor; CONFLICTING_SOURCES must name what conflicted; evidence may not
+      name operands when the result records none.
+    - An operand's CANONICAL form is length-checked after normalisation, not
+      just its input: positional expansion of a small-exponent literal is
+      unbounded relative to what arrived, and storing the expansion would break
+      round-tripping on data the constructor had accepted.
+  known_phase_2_seams: |
+    - `fingerprint` is accepted verbatim by issue_calculation_result and only
+      shape-checked (64 lowercase hex). Phase 2 must derive it from the payload
+      inside the engine; until then a wrong value is possible and no dedup index
+      may rely on it.
+    - parse_numeric's is_finite() check is defence in depth behind the regexes
+      and is therefore UNREACHABLE by construction: deleting it changes no
+      observable behaviour and no test can distinguish its presence. It earns
+      its place by holding if a regex is ever loosened -- exactly the moment no
+      current test would notice. Recorded rather than covered by a test that
+      only appears to cover it.
+    - canonical_numeric_string applies no bound of its own; it is safe only
+      because parse_numeric bounds |adjusted exponent| <= 30 upstream, for every
+      value including zero, and because no engine exists. A Phase 2 caller
+      formatting a Decimal that did NOT come through parse_numeric would produce
+      an unbounded string -- format(d, "f") expands positionally, so the output
+      size is the exponent.
+    - MAX_PRECISION_REQUEST and NESTED_OPERATION_DEPTH are DECLARED, not
+      enforced by a check -- nesting is structurally impossible in V1 and
+      precision is the engine's to apply.
+    - currency:XXX validates ISO SHAPE, not membership, so currency:XYZ is
+      accepted. It fails safe (all conversion and cross-code comparison are
+      refused) and keeps this module from being the authority on which
+      currencies exist.
+
 diagram_style:
   required_classdefs: [entry, compute, storage, cache, external, hot]
   rules:

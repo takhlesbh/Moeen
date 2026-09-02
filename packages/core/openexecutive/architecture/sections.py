@@ -266,6 +266,17 @@ SECTIONS: list[SectionSpec] = [
         wants_mermaid=True,
         diagram_kind="flowchart",
     ),
+    # `calc` — deterministic calculation contracts. Contracts + unit registry +
+    # authority boundary only; no arithmetic engine and no production caller
+    # yet. New top-level module; see `calc:` in architecture-facts.yaml.
+    SectionSpec(
+        id="calc",
+        title="Deterministic Calculation Contracts",
+        sub="Typed calculation request/result contracts, a closed unit registry with exact factors, and the authority boundary that keeps a model from calling its own arithmetic verified. Contracts only — no engine yet.",
+        kb_query="deterministic calculation contract units decimal authority fingerprint verification evidence",
+        wants_mermaid=True,
+        diagram_kind="flowchart",
+    ),
 ]
 
 
