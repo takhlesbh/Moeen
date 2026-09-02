@@ -269,6 +269,37 @@ class Unit(ContractModel):
 # ---------------------------------------------------------------------------
 
 
+def base_unit_for(unit: Unit) -> Unit | None:
+    """The dimension's base unit, or ``None`` for currency.
+
+    Multiplicative operations need this. Unlike addition — where the target unit
+    is a valid destination and every operand can simply be converted into it —
+    a product's unit is not any factor's unit, so there is nothing for a factor
+    to convert *to*. The engine therefore normalises every factor onto its own
+    dimension's base (``ha -> m2``, ``t -> kg``) and requires the target to be
+    that base as well.
+
+    Without it, ``52 kg/m2 x 11 ha -> kg`` type-checks on dimension alone and
+    multiplies the bare coefficients to 572 — the exact 10^4 error this package
+    exists to prevent, arriving with a verified status.
+
+    Currency has no base: two currency codes share a dimension but no factor
+    relates them, which is why they may never be normalised together.
+    """
+    if unit.is_currency:
+        return None
+    spec = _REGISTRY.get(unit.code)
+    return None if spec is None else Unit(code=spec.base_code)
+
+
+def is_base_unit(unit: Unit) -> bool:
+    """Whether ``unit`` is its own dimension's base. Currency is always its own."""
+    if unit.is_currency:
+        return True
+    spec = _REGISTRY.get(unit.code)
+    return spec is not None and spec.code == spec.base_code
+
+
 def known_unit_codes() -> tuple[str, ...]:
     """Every non-currency registry code, sorted. Currency codes are open-ended."""
     return tuple(sorted(_REGISTRY))

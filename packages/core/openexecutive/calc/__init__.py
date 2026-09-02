@@ -12,10 +12,17 @@ Infinity, and out-of-range exponents; a model-proposed
 status and evidence status on separate axes; and a single sanctioned channel for
 issuing a result.
 
-What is deliberately **not** here: any arithmetic, any expression evaluator, any
-unit conversion, any hashing, any tool schema, any provider call, any filesystem
-or network access. This package imports only ``json``, ``re``, ``decimal``,
-``types``, ``typing``, ``collections.abc``, ``pydantic``, and its own modules —
+Phase 2 adds the engine: :mod:`openexecutive.calc.engine` executes a closed set
+of twelve operations over ``Decimal`` with declared arity and dimensional
+signatures, and :mod:`openexecutive.calc.fingerprint` derives each result's
+identity. Arithmetic now happens here — deterministically, with no model in the
+loop — and nothing in production imports it yet.
+
+What is still deliberately **not** here: any expression evaluator, any tool
+schema, any provider call, any filesystem or network access. This package imports only ``json``, ``re``, ``decimal``,
+``types``, ``typing``, ``collections.abc``, ``hashlib`` (the fingerprint
+digest), ``time`` (the engine's monotonic budget clock, never a wall clock and
+never the source of a record's timestamp), ``pydantic``, and its own modules —
 enforced by tests that walk the package recursively rather than naming modules,
 plus a test asserting the package stays flat (no subdirectories), because
 ``pkgutil`` does not descend into a directory lacking ``__init__.py`` and a file
@@ -35,6 +42,7 @@ from openexecutive.calc.authority import (
 from openexecutive.calc.contract import (
     FINGERPRINT_EXCLUDED_FIELDS,
     FINGERPRINT_INCLUDED_FIELDS,
+    FINGERPRINT_OPTIONAL_FIELDS,
     KNOWN_AUTHORITY_IDS,
     KNOWN_AUTHORITY_VERSIONS,
     MAX_EXPRESSION_LEN,
@@ -62,6 +70,21 @@ from openexecutive.calc.contract import (
     SourceHint,
     canonical_payload_json,
     fingerprint_payload,
+)
+from openexecutive.calc.engine import (
+    LIMITS,
+    EngineLimits,
+    OperationSignature,
+    TimeConversionPolicy,
+    WeightPolicy,
+    execute,
+    execute_batch,
+    signature_for,
+)
+from openexecutive.calc.fingerprint import (
+    FAILURE_FINGERPRINT_RULE,
+    FINGERPRINT_ALGORITHM,
+    fingerprint_for,
 )
 from openexecutive.calc.numeric import (
     MAX_ADJUSTED_EXPONENT,
@@ -93,7 +116,11 @@ __all__ = [
     "AUTHORITY_VERSION",
     "CURRENCY_PREFIX",
     "FINGERPRINT_EXCLUDED_FIELDS",
+    "FAILURE_FINGERPRINT_RULE",
+    "FINGERPRINT_ALGORITHM",
     "FINGERPRINT_INCLUDED_FIELDS",
+    "FINGERPRINT_OPTIONAL_FIELDS",
+    "LIMITS",
     "KNOWN_AUTHORITY_IDS",
     "KNOWN_AUTHORITY_VERSIONS",
     "MAX_ADJUSTED_EXPONENT",
@@ -117,6 +144,7 @@ __all__ = [
     "ConversionPolicy",
     "Correlation",
     "Dimension",
+    "EngineLimits",
     "InputEvidenceStatus",
     "InputEvidenceSummary",
     "NormalizedOperand",
@@ -126,8 +154,11 @@ __all__ = [
     "OperandBasis",
     "OperandRole",
     "OperationId",
+    "OperationSignature",
     "RoundingMode",
     "SourceHint",
+    "TimeConversionPolicy",
+    "WeightPolicy",
     "Unit",
     "UnitSpec",
     "additively_compatible",
@@ -136,10 +167,14 @@ __all__ = [
     "composed_dimension",
     "convertible",
     "current_authority",
+    "execute",
+    "execute_batch",
+    "fingerprint_for",
     "fingerprint_payload",
     "issue_calculation_result",
     "known_unit_codes",
     "parse_numeric",
     "same_dimension",
+    "signature_for",
     "unit_spec",
 ]

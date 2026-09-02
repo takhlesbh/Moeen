@@ -107,6 +107,18 @@ def parse_numeric(raw: object, number_format: NumberFormat = "plain") -> Decimal
             "float upstream. Pass the originating string instead."
         )
     if isinstance(raw, int):
+        # ``str(int)`` raises CPython's own ValueError past 4,300 digits
+        # (sys.set_int_max_str_digits). Checking the magnitude first keeps the
+        # boundary's promise — "always says why", always a NumericPolicyError —
+        # and avoids the conversion entirely. ``bit_length`` is O(1) and cannot
+        # itself raise. 4,300 digits is ~14,285 bits; the real bound below is
+        # MAX_NUMERIC_STRING_LEN, and this only stops the formatting call from
+        # raising before that check can run.
+        if raw.bit_length() > 256:
+            raise NumericPolicyError(
+                f"integer operand has {raw.bit_length()} bits, far beyond the "
+                f"{MAX_NUMERIC_STRING_LEN}-character limit for a numeric value"
+            )
         text = str(raw)
     elif isinstance(raw, str):
         text = raw

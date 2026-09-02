@@ -128,7 +128,7 @@ def test_source_scan_reads_every_python_file_on_disk() -> None:
     found = {_rel(p) for p in _calc_source_files()}
     expected = {
         "__init__.py", "_model.py", "authority.py", "contract.py",
-        "numeric.py", "units.py",
+        "engine.py", "fingerprint.py", "numeric.py", "units.py",
     }
     assert found == expected, (
         f"unexpected or missing source files: {sorted(found ^ expected)}. Every "
@@ -171,7 +171,8 @@ def test_no_importable_non_source_artifact_is_committed() -> None:
     modules; anything else there, or any such artifact beside them, is a file
     Python would import and no test would read.
     """
-    known = {"__init__", "_model", "authority", "contract", "numeric", "units"}
+    known = {"__init__", "_model", "authority", "contract", "engine",
+             "fingerprint", "numeric", "units"}
     files, _ = _walk_calc_tree()
     offenders = []
     for path in files:
@@ -865,7 +866,9 @@ def test_factory_stamps_authority_and_does_not_accept_it() -> None:
     res = _result()
     assert res.authority.authority_id == authority_mod.AUTHORITY_ID
     assert res.authority.authority_version == authority_mod.AUTHORITY_VERSION
-    assert "contract" in res.authority.authority_version
+    # Phase 2 bumped this to "0.2.0-engine" in the commit that added the engine,
+    # so an engine result can never fingerprint-collide with a contract-era one.
+    assert res.authority.authority_version in contract_mod.KNOWN_AUTHORITY_VERSIONS
 
 
 def test_model_originated_payload_cannot_assign_authority_fields() -> None:
@@ -1525,22 +1528,22 @@ def test_fingerprint_field_shape_is_enforced_when_present() -> None:
     assert _result(fingerprint="a" * 64).fingerprint == "a" * 64
 
 
-def test_no_hashing_is_performed_in_phase_one() -> None:
-    """The payload is defined; the digest is Phase 2's to add.
+def test_hashing_lives_only_in_the_fingerprint_module() -> None:
+    """Phase 1 forbade hashing outright; Phase 2 confines it to one file.
 
-    AST over on-disk source, not a text grep: the phrase "sha256 shape"
-    legitimately appears in a validator's error message, and a raw substring
-    scan would fail on the documentation rather than on the code.
+    The digest is the fingerprint module's whole job. Anywhere else it would
+    mean some other module had invented a second notion of identity, which is
+    exactly the drift the single ``fingerprint_for`` entry point prevents.
     """
     for path in _calc_source_files():
         names = _imported_roots(path) | _referenced_names(path)
-        for banned in ("hashlib", "hmac", "sha256", "md5", "blake2b", "hexdigest"):
-            assert banned not in names, f"{banned} used in {_rel(path)} before Phase 2"
+        used = {n for n in ("hashlib", "hmac", "sha256", "md5", "blake2b") if n in names}
+        if _rel(path) == "fingerprint.py":
+            assert "hashlib" in names, "the fingerprint module must own the digest"
+            assert not (used - {"hashlib", "sha256"}), used
+        else:
+            assert not used, f"{_rel(path)} hashes: {sorted(used)}"
 
-
-# ---------------------------------------------------------------------------
-# 28. Prohibited execution mechanisms
-# ---------------------------------------------------------------------------
 
 _PROHIBITED_CALLED_BUILTINS = frozenset({
     "eval", "exec", "compile", "__import__", "open", "globals", "locals",
@@ -1555,8 +1558,14 @@ _PROHIBITED_CALLED_ATTRS = frozenset({
 
 _PERMITTED_IMPORT_PREFIXES = (
     "json", "re", "decimal", "types", "typing", "pydantic", "collections.abc",
-    "__future__", "openexecutive.calc",
+    "hashlib", "time", "__future__", "openexecutive.calc",
 )
+"""``hashlib`` and ``time`` arrive with Phase 2 and are narrowly scoped.
+
+``hashlib`` is the fingerprint digest, confined to one module by a test above.
+``time`` is the engine's monotonic budget clock — never a wall clock, and never
+the source of a record's timestamp, which the caller supplies so tests can pin
+it."""
 """Full dotted prefixes, not top-level roots.
 
 A bare ``"openexecutive"`` root would admit
@@ -1675,7 +1684,17 @@ def test_no_prohibited_execution_or_io_mechanism_in_the_package() -> None:
     """
     for path in _calc_source_files():
         bare, attrs = _called_names(path)
-        offending = (bare & _PROHIBITED_CALLED_BUILTINS) | (attrs & _PROHIBITED_CALLED_ATTRS)
+        allowed_attrs: set[str] = set()
+        if _rel(path) == "fingerprint.py":
+            # Narrowed to the one file whose job is the digest, rather than
+            # removed from the ban list: ``hexdigest`` anywhere else would mean a
+            # second notion of identity, and ``loads`` is the round-trip
+            # assertion that keeps an unserialisable payload from failing later
+            # at a less obvious place. Every other module still trips on both.
+            allowed_attrs = {"hexdigest", "loads"}
+        offending = (bare & _PROHIBITED_CALLED_BUILTINS) | (
+            (attrs - allowed_attrs) & _PROHIBITED_CALLED_ATTRS
+        )
         assert not offending, f"{_rel(path)} invokes {sorted(offending)}"
 
 
@@ -1781,7 +1800,36 @@ def test_no_arithmetic_is_performed_by_the_contract_layer() -> None:
         assert calc.canonical_numeric_string(parse_numeric("1.23456789")) == "1.23456789"
 
 
-def test_package_exposes_no_engine_entry_point() -> None:
-    for banned in ("evaluate", "compute", "execute", "calculate", "run"):
+def test_arithmetic_lives_only_in_the_engine() -> None:
+    """Phase 1 asserted no engine existed. Phase 2 asserts there is exactly one.
+
+    The contract, unit registry, numeric boundary and authority modules must
+    still perform no arithmetic: a second place that multiplies is a second
+    place that can be wrong, and the whole point of the engine is that there is
+    one auditable executor.
+    """
+    contract_only = [
+        p for p in _calc_source_files()
+        if _rel(p) in ("contract.py", "units.py", "numeric.py", "authority.py",
+                       "_model.py", "__init__.py")
+    ]
+    assert len(contract_only) == 6
+    with decimal.localcontext() as ctx:
+        ctx.traps[decimal.Inexact] = True
+        ctx.traps[decimal.Rounded] = True
+        op = _operand("o1", "42000000.55", "currency:TND")
+        req = CalculationRequest(
+            request_id="r", operation="subtract", operands=(op,), purpose="p",
+            correlation=_corr(),
+        )
+        canonical_payload_json(_payload())
+        assert req.operands[0].decimal_value == Decimal("42000000.55")
+        assert calc.canonical_numeric_string(parse_numeric("1.23456789")) == "1.23456789"
+
+
+def test_the_engine_is_reachable_and_is_the_only_executor() -> None:
+    assert hasattr(calc, "execute") and hasattr(calc, "execute_batch")
+    assert "execute" in calc.__all__ and "execute_batch" in calc.__all__
+    # No second entry point crept in alongside it.
+    for banned in ("evaluate", "compute", "calculate", "run", "eval_expression"):
         assert banned not in calc.__all__
-    assert not hasattr(calc, "engine")

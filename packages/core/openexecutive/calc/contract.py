@@ -380,6 +380,7 @@ ran and found nothing."""
 
 ConflictClass = Literal[
     "NONE",
+    "EXACT_MATCH",
     "WITHIN_TOLERANCE",
     "CONFLICT_DETECTED",
     "ORDER_OF_MAGNITUDE",
@@ -391,6 +392,12 @@ ConflictClass = Literal[
 it is the specific error that survived a full evaluation unnoticed: a stated
 572 tonnes against a computed 5,720. A reviewer scanning statuses should be able
 to find that class without reading every difference.
+
+``EXACT_MATCH`` and ``NONE`` are not the same thing and the difference is
+load-bearing: ``NONE`` means no comparison was made, ``EXACT_MATCH`` means one
+was made and the figures agreed to the digit. Collapsing them would make "we
+checked and it reconciles" indistinguishable from "we never checked", which is
+the distinction a reviewer most needs.
 """
 
 
@@ -601,7 +608,7 @@ class CalculationError(ContractModel):
     operand_id: str | None = Field(default=None, max_length=MAX_ID_LEN)
 
 
-KNOWN_AUTHORITY_VERSIONS: frozenset[str] = frozenset({"0.1.0-contract"})
+KNOWN_AUTHORITY_VERSIONS: frozenset[str] = frozenset({"0.1.0-contract", "0.2.0-engine"})
 """The closed set of authority versions that may appear on a result.
 
 ``authority_id`` alone was not enough. ``authority_version`` is a *fingerprint
@@ -609,8 +616,9 @@ identity field*, and it is the part the factory's own docstring calls "the one
 part of the stamp that would otherwise be trivially wrong": leaving it free text
 let a replayed contract-phase result be re-stamped ``2.0.0-engine`` through the
 ordinary ``model_validate`` path, defeating the whole point of the ``-contract``
-suffix. Phase 2 adds its engine version here in the same commit that adds the
-engine."""
+suffix. ``0.2.0-engine`` arrived with the engine; ``0.1.0-contract`` is retained
+so a result stored during the contract-only phase still validates on reload
+rather than becoming unreadable."""
 
 KNOWN_AUTHORITY_IDS: frozenset[str] = frozenset({"openexecutive.calc"})
 """The closed set of identities that may appear on a result.
@@ -872,12 +880,26 @@ FINGERPRINT_INCLUDED_FIELDS: tuple[str, ...] = (
     "authority_id",
     "authority_version",
 )
-"""The exact key set :func:`fingerprint_payload` returns.
+"""The key set :func:`fingerprint_payload` returns.
+
+Phase 2's engine adds one more, ``parameters``, carrying the operation policies
+that were actually consumed — see :data:`FINGERPRINT_OPTIONAL_FIELDS`. Keeping
+that out of this tuple and out of the pinning test let the declared contract
+drift from the real payload: a Phase 3 consumer reading this list would not know
+the policies participate in identity.
 
 Kept honest by a test comparing this tuple against the live payload keys rather
 than restating them. A declared field list that can drift from the function it
 documents is worse than no list: it reads as a guarantee while silently becoming
 a lie the first time a field is added to one and not the other."""
+
+FINGERPRINT_OPTIONAL_FIELDS: tuple[str, ...] = ("parameters",)
+"""Keys the engine adds only when they carry meaning.
+
+``parameters`` appears only when an operation actually consumed a policy. It is
+omitted otherwise on purpose: an empty ``parameters`` key present on one
+calculation and absent on another would separate two identical calculations,
+which is the fragmentation the allowlist exists to prevent."""
 
 FINGERPRINT_EXCLUDED_FIELDS: tuple[str, ...] = (
     "request_id",

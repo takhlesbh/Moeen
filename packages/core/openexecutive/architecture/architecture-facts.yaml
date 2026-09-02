@@ -3208,8 +3208,12 @@ clients:
 calc:
   module: openexecutive.calc
   status: |
-    CONTRACTS ONLY. No arithmetic engine exists and NO production module
-    imports this package. A test asserts both. Phase 2 adds the engine.
+    CONTRACTS + ENGINE. Phase 2 added a standalone deterministic engine
+    (calc/engine.py) and engine-owned fingerprints (calc/fingerprint.py).
+    NO production module imports this package -- a test parses the imports of
+    every module under openexecutive/, scripts/ and evals/ to assert it. There
+    is no CFO, provider, prompt, Committee or Executive integration; that is
+    Phase 3.
   intent: |
     Deterministic calculation foundation. A controlled single-specialist
     evaluation measured the CFO on three reconciliation checks with all
@@ -3298,6 +3302,11 @@ calc:
                        separators rejected, NaN/Inf/exponent/length bounds
     calc/contract.py   CalculationRequest/Result, statuses, fingerprint payload
     calc/authority.py  current_authority() + issue_calculation_result()
+    calc/engine.py     THE executor: closed operation signatures, arity and
+                       dimensional rules, exact conversions, Decimal-only
+                       arithmetic, typed failures, bounded batch execution
+    calc/fingerprint.py  canonical JSON + SHA-256; the engine computes an
+                       identity, never accepts one
   two_status_axes: |
     arithmetic_status  -- did an engine execute the expression?
     evidence.status    -- were the operands backed?
@@ -3468,11 +3477,201 @@ calc:
       just its input: positional expansion of a small-exponent literal is
       unbounded relative to what arrived, and storing the expansion would break
       round-tripping on data the constructor had accepted.
-  known_phase_2_seams: |
-    - `fingerprint` is accepted verbatim by issue_calculation_result and only
-      shape-checked (64 lowercase hex). Phase 2 must derive it from the payload
-      inside the engine; until then a wrong value is possible and no dedup index
-      may rely on it.
+  engine:
+    entry_points: |
+      execute(request, *, computed_at, evidence=None, time_conversion_policy=None,
+              weight_policy="normalized_by_engine") -> CalculationResult
+      execute_batch(batch, *, same keywords) -> tuple[CalculationResult, ...]
+      Both ALWAYS return a typed result. No request data can raise out of them.
+      Note what the signature does NOT accept: fingerprint, arithmetic status,
+      evidence status string, authority stamp, engine version, a pre-executed
+      expression, or a verified result. Those are constructed internally.
+    operations: |
+      Exactly twelve, dispatched from a closed mapping -- never looked up from
+      model text, and there is no expression parser anywhere:
+        add, subtract (2 operands, additively compatible, order significant for
+          subtract), multiply, divide (2, declared dimensional compositions
+          only), sum_components (1-64, component identity preserved in the
+          executed expression), percentage_of (part/whole -> pct, denominator
+          non-zero), percentage_point_difference (pct inputs -> pct_point, a
+          direct subtraction and never a relative change), ratio (2 compatible
+          -> dimensionless, direction preserved), weighted_average (values by
+          role="input", weights by role="stated_comparison" -- never
+          positionally interleaved), variance (one calculated + one stated),
+          convert_unit (registry only), interval_implied_total (4 bounds).
+      Unknown operation -> UNSUPPORTED_OPERATION.
+    dimensional_rules: |
+      multiply: mass_per_area x area -> mass (either order), and dimensionless
+        scaling. Everything else is refused. Both factors are NORMALISED onto
+        their dimension's base unit first (ha->m2, t->kg) and the target must BE
+        that base: validating by dimension alone accepted 52 kg/m2 x 11 ha -> kg
+        and returned 572 -- the exact 10^4 error this package exists to prevent,
+        carrying a verified status. A caller wanting tonnes issues an explicit
+        convert_unit, which is auditable.
+      divide: same-dimension -> dimensionless; mass / area -> mass_per_area;
+        value / dimensionless -> the value dimension. Everything else refused.
+        The motivating pair BOTH work: 52 kg/m2 x 110,000 m2 = 5,720,000 kg and
+        5,720,000 kg / 110,000 m2 = 52 kg/m2. A Phase 1 draft rejected the
+        second, which is why operation semantics live in the engine.
+      Cross-currency arithmetic is refused in every shape (add, subtract,
+        sum_components, ratio, percentage_of, divide, convert_unit) AND under
+        dimensionless scaling: composed_dimension collapses a dimensionless
+        operand to "the other operand's dimension", so a target check comparing
+        only dimension names let 1,000,000 TND x 1 -> EUR verify at par. ISO
+        codes are now compared explicitly.
+      pct and pct_point never mix, and neither converts into the other.
+      month <-> year requires an explicit time_conversion_policy, in EVERY
+        operation that converts. A draft hard-coded None inside multiplicative
+        normalisation, so divide refused the exact quotient ratio computed from
+        the same operands and multiply with a year operand was unreachable in
+        every target shape -- while the error told the integrator to supply a
+        parameter they had already supplied.
+    decimal_policy: |
+      Decimal only, never through float. The engine builds its OWN Context from
+      scratch (engine_context()) -- precision, rounding, Emin/Emax, capitals,
+      clamp, flags and all nine trap signals pinned explicitly. It is never
+      derived from getcontext(). A draft used a bare localcontext(), which
+      COPIES the caller's thread-local context and only overrode prec and three
+      traps, so: getcontext().rounding = ROUND_UP changed the 50th digit of a
+      normalized operand on divide/percentage_of/month->year -- and that digit
+      is a fingerprint payload field, so byte-identical input produced two
+      fingerprints; and getcontext().traps[Inexact] = True turned every
+      division-based operation into CALCULATION_UNAVAILABLE process-wide, a trap
+      this repository's own suite already sets. Inexact, Rounded and Subnormal
+      are deliberately NOT trapped: they are the normal condition of division. localcontext() per execution with
+      prec = MAX_PRECISION_REQUEST (50) -- which is what finally makes that
+      Phase 1 constant non-inert. InvalidOperation, DivisionByZero and Overflow
+      are TRAPPED so they surface as typed statuses instead of propagating NaN;
+      Inexact and Rounded are not, since they are the normal condition of
+      division. Intermediates run at full precision and rounding happens ONCE at
+      the final boundary; both the exact pre-rounding value and the rounded
+      value are recorded. Default ROUND_HALF_EVEN.
+      ZERO HANDLING (read this before touching _render -- two regressions came
+      from getting it wrong in opposite directions):
+        - An operand zero KEEPS ITS CANONICAL SCALE. "0.00" stays "0.00". A
+          draft normalised every zero to "0"; NormalizedOperand then refused it
+          ("a conversion that does not convert units cannot alter the number")
+          and ELEVEN of the twelve operations failed on any scaled zero -- a
+          cost stack with one 0.00 line among them -- with the outcome depending
+          on whether the operand's unit happened to change. Do not "simplify"
+          this back.
+        - Beyond the contract's numeric bound (|exponent| > MAX_ADJUSTED_EXPONENT)
+          the value can only be a COMPUTED zero: parse_numeric refuses such an
+          operand, which is what closed the 4 GB positional-expansion DoS. There
+          it is clamped to the requested scale rather than refused, because
+          "v - v" for a 31-decimal v is plainly 0 and an earlier guard written as
+          "check unless it is zero" returned no result at all.
+        - The rendered WIDTH of a zero is computed from its exponent
+          (2 + |exponent|, +1 if signed) and NEVER by rendering first:
+          format(Decimal("0E-2000000000"), "f") really does produce two billion
+          characters. Past the field width it is refused, unrendered.
+      Every non-zero engine result is re-checked against MAX_ADJUSTED_EXPONENT
+      before canonical formatting: a result is a fresh Decimal that never passed
+      through parse_numeric, and format(v,"f") expands positionally, so dividing
+      by a very small number could otherwise produce an exponent no input
+      carried.
+    exception_containment: |
+      EngineError (internal) -> the typed status it carries.
+      DivisionByZero -> DIVISION_BY_ZERO. Overflow -> RESOURCE_LIMIT_EXCEEDED.
+      InvalidOperation -> INVALID_INPUT. Other DecimalException ->
+      CALCULATION_UNAVAILABLE. MemoryError / OverflowError / RecursionError /
+      ValueError -> RESOURCE_LIMIT_EXCEEDED, because a Decimal expansion or an
+      oversized int can raise from CPython itself rather than from the decimal
+      module. A non-InputEvidenceSummary `evidence` argument raises TypeError at
+      the boundary rather than being forwarded onto the record.
+    fingerprint: |
+      Engine-generated after validation and normalization: canonical JSON
+      (sort_keys, fixed separators, ensure_ascii) then SHA-256, lowercase hex.
+      INCLUDES schema version, engine authority id + version, operation, ordered
+      normalized operands with their units, target unit, scale, rounding,
+      applicant stated value, and operation-specific parameters (time-conversion
+      and weight policies). Stated precisely: time_conversion_policy does NOT
+      select a basis -- the registry's exact factor is the only one available --
+      it is a PERMISSION TOKEN recording that the caller accepted a month/year
+      conversion, which is the assumption a reader needs to see. Both policies
+      are validated against a closed set (SUPPORTED_TIME_CONVERSION_POLICIES,
+      SUPPORTED_WEIGHT_POLICIES) before reaching the payload: Literal is erased
+      at runtime, so an unvalidated "actual/360" was accepted, the x1/12 factor
+      applied regardless, and the record asserted a basis never used -- while
+      every distinct string fragmented the fingerprint of identical arithmetic.
+      EXCLUDES request/case/run/specialist/claim ids, timestamps, labels and
+      purpose prose.
+      Verified stable across processes, across PYTHONHASHSEED values, and across
+      hostile ambient Decimal contexts (rounding, precision, Emin/Emax, clamp,
+      and every trap including Inexact) -- the last being the dependency that
+      actually mattered; hash-seed stability alone did not establish it.
+      PROVENANCE, decided deliberately: the payload carries only NORMALIZED
+      value/unit/basis/role, never original_unit, original_value or
+      conversion_applied. So "convert_unit 100 kg -> t" and "0.1 t -> t" share a
+      fingerprint. That is identity of the CALCULATION, not of the request that
+      produced it: the result is a pure function of the payload, so no two
+      calculations with DIFFERING results can collide. A dedup index keyed on the
+      fingerprint answers "the same figure was computed", not "the same request
+      was made"; a consumer needing request provenance reads the record.
+      FAILURES CARRY NO FINGERPRINT (FAILURE_FINGERPRINT_RULE = "absent"): a
+      calculation that did not run has no identity, and minting one would let a
+      dedup index answer "already computed" for something never computed.
+      No caller-supplied fingerprint is ever trusted or reused -- the engine's
+      entry points have no parameter for one.
+    evidence_separation: |
+      The engine verifies ARITHMETIC, never source truth. `evidence` defaults to
+      EVIDENCE_UNAVAILABLE and is only ever what application code passed through
+      this non-model path. A model-proposed SourceHint -- including a
+      retrieval_id_hint that merely exists as text -- can NEVER raise the status,
+      and the hint reaches neither the bindings nor the fingerprint.
+      ARITHMETIC_VERIFIED + UNSUPPORTED remains a legal, tested state: correct
+      arithmetic over unsupported inputs is still unsupported investment
+      evidence. No RetrievalSet integration in this phase.
+    batch_and_budgets: |
+      evidence_by_request maps request_id -> InputEvidenceSummary. There is NO
+      batch-wide evidence parameter: operand_id is unique only WITHIN a request
+      and models reuse generic ids, so a shared summary stamped validated
+      evidence onto any sibling whose ids collided, reaching
+      is_verified_evidence() for operands no evidence layer had seen.
+      Max 32 requests, one typed result per request, input order preserved. A
+      failed request does NOT erase its siblings -- Phase 1 measured the
+      alternative, where one malformed claim discarded all eleven in a
+      specialist result. No state on module globals or shared singletons.
+      Budgets (250 ms/request, 2 s/batch) are measured with a monotonic clock
+      and are MEASURED AND REPORTED, NOT PREEMPTIVE: a synchronous Python call
+      cannot interrupt itself without threads or signals, which this package
+      deliberately does not own. The real protection is pre-validation -- size
+      and exponent limits are enforced BEFORE any Decimal work, and no
+      authorized operation has cost superlinear in its input length. Over-budget
+      batches fail their remaining requests typed rather than silently dropping
+      them.
+    phase_3_seam: |
+      CFO integration. The approved shape is the two-stage pipeline: stage 1 the
+      specialist emits CalculationRequests; the application executes them here;
+      stage 2 the specialist receives authoritative results. Executive
+      propagation (render_for_executive returns narrative verbatim) remains the
+      named open decision from the Phase 1 architecture gate.
+  closed_phase_2_seams: |
+    - RESOLVED: the engine derives the fingerprint itself and its entry points
+      accept none. issue_calculation_result still takes the parameter (Phase 1
+      contract, unchanged), but no engine path forwards a caller value.
+    - RESOLVED: MAX_PRECISION_REQUEST is now the engine's working precision.
+    - RESOLVED: parse_numeric no longer leaks CPython's raw ValueError on an
+      oversized int -- a bit_length pre-check keeps the promise that the
+      boundary always raises NumericPolicyError.
+    - RESOLVED: per-operation arity and dimensional semantics now exist, in the
+      engine rather than the contract.
+    - RESOLVED: AUTHORITY_VERSION is 0.2.0-engine. Engine results cannot
+      fingerprint-collide with hand-built contract-era ones; 0.1.0-contract is
+      retained in KNOWN_AUTHORITY_VERSIONS so a stored contract-era result still
+      validates on reload.
+    - RESOLVED: no framework exception text (pydantic messages, tracebacks,
+      truncated echoes of computed values) reaches a durable record; failures
+      carry engine-authored codes and details.
+    - RESOLVED: a caller kwarg that no conversion consumed no longer fragments
+      fingerprint identity -- both policy parameters are gated on actual use.
+    - RESOLVED: weighted_average rejects negative weights, which could place the
+      "average" outside the convex hull of its inputs (10 and 20 weighted -2 and
+      1 gave 0).
+    - OPEN: canonical_numeric_string still applies no bound of its own; the
+      engine re-checks every result's exponent before formatting, so the only
+      remaining exposure is a caller formatting a Decimal that never came
+      through parse_numeric or the engine.
     - parse_numeric's is_finite() check is defence in depth behind the regexes
       and is therefore UNREACHABLE by construction: deleting it changes no
       observable behaviour and no test can distinguish its presence. It earns

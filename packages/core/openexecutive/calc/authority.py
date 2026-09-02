@@ -61,14 +61,16 @@ Must be a member of ``KNOWN_AUTHORITY_IDS``, which the contract validates, so a
 stamp naming an authority that never existed cannot survive deserialization."""
 assert AUTHORITY_ID in KNOWN_AUTHORITY_IDS
 
-AUTHORITY_VERSION = "0.1.0-contract"
-"""Deliberately marked ``-contract``: this version computes nothing.
+AUTHORITY_VERSION = "0.2.0-engine"
+"""Bumped from ``0.1.0-contract`` in the commit that added the engine.
 
-Phase 2's engine takes a different version string, so any result fingerprinted
-under this one is recognisable as having come from the contract-only phase.
+The version is part of the fingerprint payload, so a result computed by this
+engine can never collide with one hand-built under the contract-only phase —
+which is the whole point of the suffix, and was briefly untrue when the engine
+shipped while the stamp still read ``-contract``.
 
 Must be a member of ``KNOWN_AUTHORITY_VERSIONS``, which the contract validates,
-so a replayed result cannot be re-stamped with an engine version.
+so a replayed result cannot be re-stamped with a version that never existed.
 """
 assert AUTHORITY_VERSION in KNOWN_AUTHORITY_VERSIONS
 
