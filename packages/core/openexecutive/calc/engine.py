@@ -1411,11 +1411,16 @@ def _failure(
 ) -> CalculationResult:
     """A typed failure result. No fingerprint — see ``FAILURE_FINGERPRINT_RULE``.
 
-    The timestamp is re-canonicalised here even though ``execute`` already did
-    so. That is not redundancy: this function is the recovery path, and it must
+    ``computed_at`` is not assumed to be canonical. Some callers reach here
+    after ``execute`` has already canonicalised it, but others do not:
+    ``execute_batch``'s over-budget path calls this with the caller's raw
+    value. So the timestamp is canonicalised here defensively, falling back to
+    ``FALLBACK_COMPUTED_AT`` when the value cannot be canonicalised at all.
+    That is what makes this function total: it is the recovery path, so it must
     be constructible for *any* input, including the case where the caller's
-    clock value is itself what failed. Passing the rejected value back through
-    is what made the handler re-raise the exception it existed to convert.
+    clock value is itself what failed. Handing a rejected value back to the
+    constructor that had just refused it is what made the handler re-raise the
+    exception it existed to convert.
     """
     from openexecutive.calc.authority import issue_calculation_result
 
