@@ -56,6 +56,7 @@ from openexecutive.calc.units import (
     same_dimension,
     unit_spec,
 )
+from tests.unit._calc_import_scan import references_calc, scan_tree
 
 CALC_DIR = pathlib.Path(__file__).resolve().parents[2] / "openexecutive" / "calc"
 """Anchored on THIS test file's own location — never on scanned code.
@@ -1723,55 +1724,66 @@ def test_calc_is_a_leaf_package_with_no_agent_or_provider_coupling() -> None:
             )
 
 
-def test_no_production_module_imports_calc_yet() -> None:
-    """Phase 1 ships uncoupled; a caller arrives with the Phase 2 engine.
+# Production modules permitted to import ``openexecutive.calc`` at all. An
+# allowlist, not a prohibition: the original invariant could only hold until the
+# package had a caller. What must still hold is that the coupling stays small
+# enough to review by reading, and that `calc` remains a LEAF — the dependency
+# runs one way and no entry here may be imported *by* calc.
+_CALC_IMPORTERS = frozenset(
+    {
+        "specialists/calculation_gateway.py",
+        "specialists/calculation_proposal.py",
+    }
+)
 
-    Parsed, not grepped. A two-literal substring scan for ``openexecutive.calc``
-    missed ``from ..calc import Unit`` entirely — the same relative-import
-    blindness that defeated the in-package allowlist, in the test that asserts
-    the headline "nothing in production imports this" invariant.
+
+def test_only_allowlisted_production_modules_import_calc() -> None:
+    """The set of production importers of ``calc`` is bounded and named.
+
+    Parsed, not grepped, and the resolution logic is shared with the engine
+    scanner in ``test_calc_adversarial.py`` via ``_calc_import_scan`` — two
+    copies drifted, and between them missed ``from openexecutive import calc``,
+    ``from openexecutive.calc import engine``, ``from .. import calc`` and
+    ``from ..calc import engine``. ``ImportFrom.names`` is inspected as well as
+    ``ImportFrom.module``, which is what those forms hide in.
+
+    Matched on RESOLVED ABSOLUTE paths, anchored at the package root. A
+    root-relative string would let any scanned tree — ``evals/``, ``scripts/`` —
+    inherit the exemption by reusing the path, so a shadow module could silence
+    the check by existing.
     """
     package_root = CALC_DIR.parent
     repo_root = package_root.parents[2]
-    roots = [package_root, package_root.parent / "scripts", repo_root / "evals"]
+    allowed = {(package_root / entry).resolve() for entry in _CALC_IMPORTERS}
     offenders: list[str] = []
-    for root in roots:
+    for root, package_name in (
+        (package_root, "openexecutive"),
+        (package_root.parent / "scripts", None),
+        (repo_root / "evals", None),
+    ):
         if not root.is_dir():
             continue
-        for path in root.rglob("*.py"):
-            parts = path.parts
-            if "calc" in parts or "__pycache__" in parts or ".venv" in parts:
-                continue
-            if "tests" in parts:
-                # This very file imports calc; test code is not a production caller.
-                continue
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
-            except SyntaxError:  # pragma: no cover - not our code to fix
-                continue
-            package = path.relative_to(root).parts[:-1]
-            for node in ast.walk(tree):
-                targets: set[str] = set()
-                if isinstance(node, ast.Import):
-                    targets = {a.name for a in node.names}
-                elif isinstance(node, ast.ImportFrom):
-                    level = node.level or 0
-                    if level == 0:
-                        targets = {node.module} if node.module else set()
-                    else:
-                        base = ["openexecutive", *package][
-                            : len(package) + 1 - (level - 1)
-                        ] or ["openexecutive"]
-                        if node.module:
-                            targets = {".".join([*base, node.module])}
-                        else:
-                            targets = {".".join([*base, a.name]) for a in node.names}
-                for target in targets:
-                    if target == "openexecutive.calc" or target.startswith(
-                        "openexecutive.calc."
-                    ):
-                            offenders.append(f"{path.relative_to(root)}: {target}")
-    assert offenders == [], f"calc is imported by production code: {offenders}"
+        scanned = scan_tree(
+            root,
+            package_name=package_name,
+            skip_parts=("calc", "__pycache__", ".venv", "tests"),
+        )
+        for path, targets in scanned.items():
+            referenced = references_calc(targets)
+            if referenced and path.resolve() not in allowed:
+                offenders.append(f"{path.relative_to(root)}: {sorted(referenced)}")
+    assert offenders == [], (
+        f"openexecutive.calc may only be imported by {sorted(_CALC_IMPORTERS)}; "
+        f"found: {sorted(offenders)}"
+    )
+
+
+
+def test_every_allowlisted_calc_importer_exists() -> None:
+    """A stale entry naming a deleted file would quietly widen the boundary."""
+    package_root = CALC_DIR.parent
+    for relative in _CALC_IMPORTERS:
+        assert (package_root / relative).is_file(), f"allowlisted {relative} is gone"
 
 
 # ---------------------------------------------------------------------------

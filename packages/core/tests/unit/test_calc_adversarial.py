@@ -36,6 +36,7 @@ from openexecutive.calc.contract import (
 from openexecutive.calc.engine import execute, execute_batch
 from openexecutive.calc.numeric import NumericPolicyError, parse_numeric
 from openexecutive.calc.units import Unit
+from tests.unit._calc_import_scan import reaches_execution, scan_tree
 
 AT = "2026-09-02T00:00:00Z"
 TND = "currency:TND"
@@ -467,36 +468,50 @@ def test_calc_never_imports_a_model_provider_or_agent_path() -> None:
                     assert f"openexecutive.{package}" not in module
 
 
-def test_no_production_module_imports_the_engine_yet() -> None:
-    """Phase 2 ships standalone; a caller arrives with Phase 3."""
+# The one production module permitted to EXECUTE a calculation or mint an
+# authority stamp. One door is what makes "how many calculations ran" a
+# countable question; a second entry here is a second place arithmetic can
+# happen.
+_ENGINE_IMPORTERS = frozenset({"specialists/calculation_gateway.py"})
+
+
+def test_only_the_calculation_gateway_imports_the_engine() -> None:
+    """Exactly one production module may reach an execution or authority surface.
+
+    "Reach" is broader than "name". ``calc/__init__`` re-exports
+    ``execute_batch`` and ``issue_calculation_result``, so a module holding the
+    package object can execute without ever mentioning ``engine`` — and an
+    earlier version of this scanner, which matched only the dotted string
+    ``openexecutive.calc.engine`` in ``ImportFrom.module``, missed four ordinary
+    forms including ``from openexecutive.calc import engine``. The resolution
+    logic now lives in ``_calc_import_scan`` and is shared with the sibling
+    scanner in ``test_calc_contract_foundation.py``, so the two cannot drift.
+
+    Allowlist entries are resolved to ABSOLUTE paths: a root-relative string
+    would let any scanned tree inherit the exemption by reusing the path.
+    """
     root = _CALC_DIR.parent
+    allowed = {(root / entry).resolve() for entry in _ENGINE_IMPORTERS}
     offenders: list[str] = []
-    for path in root.rglob("*.py"):
-        if "calc" in path.parts or "__pycache__" in path.parts:
-            continue
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        tree = ast.parse(text)
-        package = path.relative_to(root).parts[:-1]
-        for node in ast.walk(tree):
-            targets: set[str] = set()
-            if isinstance(node, ast.Import):
-                targets = {a.name for a in node.names}
-            elif isinstance(node, ast.ImportFrom):
-                level = node.level or 0
-                if level == 0:
-                    targets = {node.module} if node.module else set()
-                else:
-                    base = ["openexecutive", *package][: len(package) + 1 - (level - 1)] or [
-                        "openexecutive"
-                    ]
-                    targets = (
-                        {".".join([*base, node.module])} if node.module
-                        else {".".join([*base, a.name]) for a in node.names}
-                    )
-            for target in targets:
-                if target == "openexecutive.calc" or target.startswith("openexecutive.calc."):
-                    offenders.append(f"{path.relative_to(root)}: {target}")
-    assert offenders == [], f"engine imported by production code: {offenders}"
+    scanned = scan_tree(
+        root, package_name="openexecutive", skip_parts=("calc", "__pycache__")
+    )
+    for path, targets in scanned.items():
+        reaching = reaches_execution(targets)
+        if reaching and path.resolve() not in allowed:
+            offenders.append(f"{path.relative_to(root)}: {sorted(reaching)}")
+    assert offenders == [], (
+        f"execution and authority surfaces may only be reached by "
+        f"{sorted(_ENGINE_IMPORTERS)}; found: {sorted(offenders)}"
+    )
+
+
+
+def test_the_allowlisted_engine_importer_exists() -> None:
+    """An allowlist naming a deleted file silently permits everything."""
+    root = _CALC_DIR.parent
+    for relative in _ENGINE_IMPORTERS:
+        assert (root / relative).is_file(), f"allowlisted {relative} is gone"
 
 
 def test_the_whole_engine_surface_parses_under_python_3_11() -> None:
@@ -545,3 +560,244 @@ def test_no_3_13_only_api_is_used() -> None:
         }
         for name in banned:
             assert name not in used, f"{path.name} uses a 3.12+/3.13+ API: {name}"
+
+
+# ---------------------------------------------------------------------------
+# 46. The scanner's own blind spots — every form that once slipped past
+# ---------------------------------------------------------------------------
+
+# Each entry evaded one or both allowlists before ``ImportFrom.names`` was
+# resolved. They are exercised against the REAL scanners over a temporary tree
+# laid out exactly like the repository, so a regression in the shared resolver
+# fails here rather than in a review two rounds later.
+_BYPASS_FORMS = {
+    "from_package_import_calc": "from openexecutive import calc\n",
+    "from_calc_import_engine": "from openexecutive.calc import engine\n",
+    "from_calc_import_authority": "from openexecutive.calc import authority\n",
+    "relative_from_parent_import_calc": "from .. import calc\n",
+    "relative_from_parent_calc_import_engine": "from ..calc import engine\n",
+    "import_dotted_package": "import openexecutive.calc\n",
+    "from_calc_import_execute_batch": "from openexecutive.calc import execute_batch\n",
+    "star_import_from_calc": "from openexecutive.calc import *\n",
+}
+
+# Dynamic imports with a LITERAL module name. The shared resolver reads these
+# and only these spellings; a computed name, an aliased ``importlib`` or a
+# relative literal are outside the static guard, and
+# ``test_a_computed_module_name_is_outside_the_static_guard`` pins that
+# boundary so the docs cannot claim more than the scan does.
+_DYNAMIC_IMPORT_FORMS = {
+    "importlib_import_module_calc": (
+        'import importlib\ncalc = importlib.import_module("openexecutive.calc")\n'
+    ),
+    "importlib_import_module_engine": (
+        'import importlib\n'
+        'engine = importlib.import_module("openexecutive.calc.engine")\n'
+    ),
+    "importlib_import_module_authority": (
+        'import importlib\n'
+        'authority = importlib.import_module("openexecutive.calc.authority")\n'
+    ),
+    "bare_import_module_engine": (
+        'from importlib import import_module\n'
+        'engine = import_module("openexecutive.calc.engine")\n'
+    ),
+    "dunder_import_engine": 'engine = __import__("openexecutive.calc.engine")\n',
+}
+
+_ALL_BYPASS_FORMS = {**_BYPASS_FORMS, **_DYNAMIC_IMPORT_FORMS}
+
+
+def _fake_repo(tmp_path: pathlib.Path, source: str) -> pathlib.Path:
+    """A tree matching the real layout, holding one non-allowlisted module.
+
+    The scanners derive their roots from ``CALC_DIR``, so the depth has to match
+    the repository exactly for the production code to walk this tree.
+    """
+    package = tmp_path / "packages" / "core" / "openexecutive"
+    (package / "calc").mkdir(parents=True)
+    (package / "calc" / "__init__.py").write_text("", encoding="utf-8")
+    (package / "orchestrator").mkdir(parents=True)
+    (package / "orchestrator" / "__init__.py").write_text("", encoding="utf-8")
+    (package / "orchestrator" / "second_door.py").write_text(source, encoding="utf-8")
+    return package / "calc"
+
+
+@pytest.mark.parametrize("form", sorted(_ALL_BYPASS_FORMS))
+def test_the_engine_scanner_catches_every_bypass_form(
+    form: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REGRESSION: four of these reached execution with the scanner green.
+
+    ``calc/__init__`` re-exports ``execute_batch`` and
+    ``issue_calculation_result``, so binding the package is enough to execute —
+    which is why a bare package binding counts here even though it never names
+    the engine module.
+    """
+    calc_dir = _fake_repo(tmp_path, _ALL_BYPASS_FORMS[form])
+    monkeypatch.setattr(
+        "tests.unit.test_calc_adversarial._CALC_DIR", calc_dir, raising=True
+    )
+    with pytest.raises(AssertionError, match="second_door.py"):
+        test_only_the_calculation_gateway_imports_the_engine()
+
+
+@pytest.mark.parametrize("form", sorted(_ALL_BYPASS_FORMS))
+def test_the_calc_scanner_catches_every_bypass_form(
+    form: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tests.unit.test_calc_contract_foundation as foundation
+
+    calc_dir = _fake_repo(tmp_path, _ALL_BYPASS_FORMS[form])
+    monkeypatch.setattr(foundation, "CALC_DIR", calc_dir, raising=True)
+    with pytest.raises(AssertionError, match="second_door.py"):
+        foundation.test_only_allowlisted_production_modules_import_calc()
+
+
+@pytest.mark.parametrize("ancestor", ["tests", "calc"])
+def test_the_scanners_are_not_silenced_by_an_ancestor_named_like_a_skip_part(
+    ancestor: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REGRESSION (LOW): ``skip_parts`` was matched against the ABSOLUTE path.
+
+    A scan root that merely lived under a directory named ``tests`` or ``calc``
+    — a CI checkout, a ``tmp_path`` — skipped every file, and both boundary
+    tests passed having scanned nothing. Filtering is now relative to the scan
+    root, and this drives the REAL scanners over such a tree to prove it.
+    """
+    import tests.unit.test_calc_contract_foundation as foundation
+
+    calc_dir = _fake_repo(
+        tmp_path / ancestor, "from openexecutive.calc.engine import execute_batch\n"
+    )
+    assert ancestor in calc_dir.parts
+
+    monkeypatch.setattr(
+        "tests.unit.test_calc_adversarial._CALC_DIR", calc_dir, raising=True
+    )
+    with pytest.raises(AssertionError, match="second_door.py"):
+        test_only_the_calculation_gateway_imports_the_engine()
+
+    monkeypatch.setattr(foundation, "CALC_DIR", calc_dir, raising=True)
+    with pytest.raises(AssertionError, match="second_door.py"):
+        foundation.test_only_allowlisted_production_modules_import_calc()
+
+
+def test_scan_tree_still_skips_matching_directories_below_the_root(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Root-relative filtering must not have thrown the filter away."""
+    from tests.unit._calc_import_scan import scan_tree
+
+    root = tmp_path / "tests" / "checkout" / "openexecutive"
+    source = "from openexecutive.calc.engine import execute_batch\n"
+    for relative in ("orchestrator/door.py", "tests/fixture.py", "calc/engine.py"):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source, encoding="utf-8")
+
+    scanned = scan_tree(root, package_name="openexecutive", skip_parts=("calc", "tests"))
+    assert set(scanned) == {root / "orchestrator" / "door.py"}
+
+
+def test_a_computed_module_name_is_outside_the_static_guard() -> None:
+    """Scope, stated honestly: these are controlled by review, not by the scan.
+
+    If the resolver ever starts seeing one of them, that is a capability change
+    worth documenting — update the resolver's docstring and this test together
+    rather than letting the docs lag the code in either direction.
+    """
+    import tests.unit._calc_import_scan as resolver
+    from tests.unit._calc_import_scan import (
+        import_targets,
+        reaches_execution,
+        references_calc,
+    )
+
+    undecidable = (
+        'import importlib\nname = "openexecutive.calc"\nimportlib.import_module(name)\n',
+        'import importlib as il\nil.import_module("openexecutive.calc.engine")\n',
+        'import importlib\nimportlib.import_module("..calc", package=__package__)\n',
+    )
+    for source in undecidable:
+        targets = import_targets(
+            ast.parse(source),
+            path=pathlib.Path("orchestrator/second_door.py"),
+            root=pathlib.Path(),
+            package_name="openexecutive",
+        )
+        assert references_calc(targets) == set(), f"{source!r} is documented as unseen"
+        assert reaches_execution(targets) == set()
+
+    doc = " ".join((resolver.__doc__ or "").split())
+    assert "outside this guard" in doc
+    assert "controlled by review" in doc
+    assert "not statically decidable" in doc
+
+
+def test_the_bypass_suite_fails_without_node_names_resolution() -> None:
+    """Mutation-resistance, stated as a property of the resolver itself.
+
+    Every form in ``_BYPASS_FORMS`` hides its target in ``ImportFrom.names``. A
+    resolver that reads only ``ImportFrom.module`` returns nothing for them, so
+    the tests above would stop failing and start passing vacuously — the exact
+    regression that shipped. This pins the difference directly. (The dynamic
+    forms are deliberately not here: they have no ``ImportFrom`` at all, and
+    their mutation resistance is the scanner tests themselves failing when the
+    ``Call`` branch is removed.)
+    """
+    from tests.unit._calc_import_scan import import_targets, reaches_execution
+
+    for source in _BYPASS_FORMS.values():
+        tree = ast.parse(source)
+        # ``root`` is the PACKAGE root, so the path is relative to it and
+        # carries no leading "openexecutive/" — the resolver prefixes the
+        # package name itself.
+        targets = import_targets(
+            tree,
+            path=pathlib.Path("orchestrator/second_door.py"),
+            root=pathlib.Path(),
+            package_name="openexecutive",
+        )
+        assert reaches_execution(targets), f"{source!r} must reach execution"
+
+        module_only = {
+            (node.module, False)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        assert not reaches_execution(module_only), (
+            f"{source!r} is invisible to a module-only resolver — which is why "
+            "node.names must be resolved"
+        )
+
+
+def test_importing_a_calc_type_is_not_treated_as_reaching_execution() -> None:
+    """The screen must not over-report, or it stops being obeyed.
+
+    ``calculation_proposal.py`` imports calc TYPES and is allowlisted for the
+    package, but must not be flagged as an executor.
+    """
+    from tests.unit._calc_import_scan import import_targets, reaches_execution
+
+    tree = ast.parse("from openexecutive.calc.contract import Operand\n")
+    targets = import_targets(
+        tree,
+        path=pathlib.Path("specialists/calculation_proposal.py"),
+        root=pathlib.Path(),
+        package_name="openexecutive",
+    )
+    assert reaches_execution(targets) == set()
+
+    proposal = (
+        _CALC_DIR.parent / "specialists" / "calculation_proposal.py"
+    ).read_text(encoding="utf-8")
+    proposal_targets = import_targets(
+        ast.parse(proposal),
+        path=pathlib.Path("specialists/calculation_proposal.py"),
+        root=pathlib.Path(),
+        package_name="openexecutive",
+    )
+    assert reaches_execution(proposal_targets) == set(), (
+        "the proposal module imports types only and must not read as an executor"
+    )

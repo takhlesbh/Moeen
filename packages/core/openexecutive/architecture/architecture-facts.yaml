@@ -1,14 +1,27 @@
 # Curated, hand-written facts about the Open Executive architecture.
 #
-# This file is the highest-trust source of truth fed into the LLM when
-# generating the /architecture page. It captures design intent and
-# invariants that are not derivable from a quick code skim — the *why*
-# behind the code. The page generator combines this with:
-#   - live introspection (agents, workflows, openapi)
-#   - repo code excerpts
-#   - retrieved KB chunks
-# A change to this file invalidates the cache and triggers regeneration
-# of every section on next view.
+# The curated source of truth for the *why* behind the code — design intent
+# and invariants that are not derivable from a quick code skim.
+#
+# NOT on the request path. The /architecture page is served from static,
+# hand-authored JSON under architecture/prebuilt/<section_id>.json;
+# architecture/prebuilt.py only reads those files, and NOTHING on the live
+# request path calls an LLM (see CLAUDE.md → "Architecture Docs").
+#
+# architecture/generator.py (generate_section) and architecture/facts.py
+# (gather_facts) STILL EXIST, as authoring aids only: they can draft a section
+# from a SectionSpec plus a facts bundle when someone chooses to run them, and
+# they are not invoked by any endpoint. An earlier version of this header
+# claimed an edit here "triggers regeneration of every section"; that was
+# false — nothing watches this file — and it invited hand-edits to be mistaken
+# for generated output. A later version over-corrected to "that generator no
+# longer exists", which was also false. The accurate statement is the one in
+# architecture/__init__.py: the generator remains as an authoring aid and is
+# not used at request time.
+#
+# When a change alters what a section already describes, re-author the
+# affected prebuilt/<section_id>.json BY HAND in the same PR (validate with
+# `python -m json.tool`), and update the notes here.
 
 system:
   name: Open Executive
@@ -3208,12 +3221,290 @@ clients:
 calc:
   module: openexecutive.calc
   status: |
-    CONTRACTS + ENGINE. Phase 2 added a standalone deterministic engine
-    (calc/engine.py) and engine-owned fingerprints (calc/fingerprint.py).
-    NO production module imports this package -- a test parses the imports of
-    every module under openexecutive/, scripts/ and evals/ to assert it. There
-    is no CFO, provider, prompt, Committee or Executive integration; that is
-    Phase 3.
+    CONTRACTS + ENGINE + AN UNWIRED GATEWAY. Phase 2 added the deterministic
+    engine (calc/engine.py) and engine-owned fingerprints. Phase 3B1 added two
+    modules under specialists/ and NOTHING ELSE:
+
+      specialists/calculation_proposal.py  CalculationProposal (model-shaped)
+      specialists/calculation_gateway.py   execute_proposals + the record type
+
+    They are the ONLY production importers of openexecutive.calc, and the
+    gateway is the only module that can reach an execution or authority surface.
+    Two allowlists, with different scopes:
+      * test_calc_contract_foundation scans openexecutive/, scripts/ AND evals/
+        for any openexecutive.calc* import against a 2-entry allowlist. This is
+        the test that makes the cross-tree property true.
+      * test_calc_adversarial scans openexecutive/ only, for execution reach
+        against a 1-entry allowlist.
+    Both match RESOLVED ABSOLUTE paths, so a shadow module reusing an
+    allowlisted relative path cannot inherit the exemption, and both are paired
+    with an existence test so a stale entry cannot turn the check into a
+    tautology.
+
+    ALL THREE boundary scans now share ONE resolver,
+    tests/unit/_calc_import_scan.py: the two allowlists above and the gateway
+    suite's own one-door re-assertion (test_calculation_gateway
+    `_engine_importers`), which had been a third hand-rolled copy. Each copy
+    read only ImportFrom.module and ignored ImportFrom.names, and between them
+    missed five ordinary forms -- measured, not hypothesised:
+        from openexecutive import calc            MISSED by all three
+        from openexecutive.calc import engine     MISSED by both engine scans
+        from openexecutive.calc import authority          "
+        from .. import calc                               "
+        from ..calc import engine                         "
+    Every form, plus the direct dotted imports the old scans did catch, is
+    driven through each of the three REAL scans over a temporary tree, and a
+    mutation test pins that a module-only resolver cannot see them.
+
+    Two further properties of the shared resolver, each with a regression test:
+      * skip_parts (`calc`, `tests`, `__pycache__`, `.venv`) are matched against
+        the path RELATIVE TO THE SCAN ROOT. An earlier version matched the
+        absolute path, so a root that merely lived under a directory named
+        `tests` or `calc` (a CI checkout, a tmp_path) scanned zero files and
+        the boundary passed vacuously.
+      * Dynamic imports are resolved ONLY when the module name is a string
+        literal in one of three spellings: importlib.import_module("..."),
+        bare import_module("...") after `from importlib import import_module`,
+        and __import__("..."). A computed name, an aliased importlib, a relative
+        literal with package=__package__, or a module reached through a
+        dependency are NOT statically decidable here; they are outside this
+        guard and controlled by review. The resolver's docstring and a test
+        state that scope explicitly, so a green run never implies more than
+        was checked.
+    "Reach" is broader than "name", which is why the engine scanner is defined
+    over an EXECUTION SURFACE rather than a module string: calc/__init__
+    re-exports execute, execute_batch, issue_calculation_result and
+    current_authority, so binding the bare package (`from openexecutive import
+    calc`) is enough to execute without ever mentioning `engine`. The surface is
+    the engine module, the authority module, those four re-exported names, and
+    any binding of the package itself. Importing a calc TYPE
+    (`from openexecutive.calc.contract import Operand`) is deliberately NOT
+    reach -- calculation_proposal.py does exactly that and must not read as an
+    executor.
+
+    The gateway is DELIBERATELY UNWIRED: nothing constructs it. Putting
+    unconsumed work on the live CFO path would be cost and risk for no benefit,
+    and a test asserts no other module references either new file. The CFO,
+    Executive, Committee, UI and persistence are untouched; that is Phase 3B2.
+  phase_3b1_scope: |
+    THE READ-ONLY BOUNDARY IS THE DESIGN. Six earlier attempts at this slice
+    were rejected in review, and every one of them edited
+    specialists/result_contract.py. That file has exactly ONE live consumer
+    (agents/finance.py), two recovery paths documented as unable to fail, and a
+    reason-composer whose "; " delimiter is load-bearing. The two HIGHs in the
+    final rejected round both came from adding a validator to a type whose
+    producers had not been enumerated:
+
+      * _degraded() coerces `specialist` by truthiness, not validation, so any
+        validator on SpecialistResult.specialist makes the parser raise, be
+        caught, and raise again from the retry -- a double fault on the live
+        path.
+      * _join() joins with "; ", so any sanitiser treating that as a
+        delimiter-injection vector rewrites the parser's own output and emits
+        FALSE tamper markers into a record nothing tampered with.
+
+    This slice adds no field and no validator to that file, which makes both
+    failures structurally impossible rather than merely fixed. result_contract,
+    finance, router, the tool schema and every calc/ production file are
+    unchanged.
+
+    Enforced by STRUCTURAL assertions, not a diff: SpecialistResult declares no
+    calculation field; finance.py and router.py contain no reference to either
+    new module; calc imports nothing from specialists (it stays a leaf); and
+    exactly one production path imports calc.engine. An earlier version diffed
+    against HEAD, which is non-empty only while the change is uncommitted -- it
+    would have passed unconditionally from the moment it landed, while a doc
+    cited it as the guarantee.
+  phase_3b1_three_types: |
+    Model proposals, gateway requests and engine results are three DISTINCT
+    types, and which one carries what is the whole authority story:
+
+      CalculationProposal (NEW, specialists/)  intent only. No request_id, no
+        correlation, no result, status, evidence, fingerprint, authority or
+        computed_at. With extra="forbid" a payload attempting any of them is
+        rejected loudly rather than stripped silently.
+      CalculationRequest  (calc/, UNCHANGED)   gateway-authored: proposal
+        content + minted request_id + minted Correlation.
+      CalculationResult   (calc/, UNCHANGED)   engine-authored, via
+        issue_calculation_result only.
+
+    SpecialistCalculations is a frozen DATACLASS and a TRANSPORT CONTAINER. It
+    establishes NO PROVENANCE WHATSOEVER, and the list matters because TWO
+    successive docstrings here claimed a guarantee and a review falsified each:
+
+      1st claim: "no model_validate, so no deserialization path". False.
+      2nd claim: "no AUTOMATIC pydantic deserializer".            Also false --
+        pydantic builds a validator for stdlib dataclasses, so declaring this
+        type as a BaseModel field deserializes an untrusted body straight into
+        it, forged 1+1=999999 record and all, with is_verified_evidence() True.
+        `model_validate` not being an attribute proves nothing; pydantic never
+        needed it to be.
+
+    What is actually true: direct construction, pickle, pydantic dataclass
+    handling, persistence and replay ALL reconstitute one, and none of them
+    attests to anything. Trust in the records inside comes from one place only
+    -- this module's code path obtained them from the engine in this process.
+    A consumer receiving a SpecialistCalculations from anywhere else has learned
+    nothing, and PHASE 3B2 MUST NOT TRUST THIS TYPE ALONE.
+  phase_3b1_text_policy: |
+    TWO POLICIES, NOT ONE, and REJECT-ONLY in both. There is NO `is_safe_text`
+    -- an earlier version of this block described a single predicate of that
+    name and was left in place after the split, so it named a function that does
+    not exist and asserted a rule the code had stopped applying.
+
+    Shared base rule (`_is_bounded_printable`): a string must be non-empty,
+    within its field's length bound, and printable.
+
+    str.isprintable() carries the character screen, and naming the mechanism
+    accurately matters: an earlier version credited a redundant Unicode-category
+    clause sitting beside it, which a probe showed could NEVER be the deciding
+    term (zero codepoints are printable AND in Cc/Cf/Zl/Zp). isprintable is
+    false for every Unicode Other/Separator character except ASCII space, so it
+    covers Cc (LF, CR, ESC, NUL), Cf (NEL, bidi overrides, ZWJ, BOM), Zl
+    (U+2028) and Zp (U+2029) -- and is STRICTER than the removed list, also
+    excluding surrogates, private use, unassigned and the other Zs spaces. It is
+    category-defined, so a codepoint added to Unicode later is covered with no
+    code change. The clause and its unicodedata import were deleted.
+
+    IDENTIFIERS (`is_safe_identifier`) -- claim_ref, operand_id,
+    retrieval_id_hint, and the gateway's specialist / case_id / run_id. Base
+    rule PLUS no surrounding whitespace, so " c1" and "c1" cannot be two
+    spellings of one id: an identifier is MATCHED, and a trimming validator
+    turns an equality check into a near-equality check.
+
+    DESCRIPTIVE TEXT (`is_safe_descriptive_text`) -- purpose, operand label,
+    document_label, filename, quoted_text. Base rule and NOTHING MORE. In
+    particular "; " IS ALLOWED. An earlier version refused it because
+    result_contract._join composes reasons with that delimiter -- which coupled
+    this module's INPUT validation to another module's private OUTPUT format, so
+    a specialist writing "runway; then covenant headroom" was rejected for a
+    reason having nothing to do with its own field, and the coupling would have
+    inverted silently the day _join changed separators. Escaping a delimiter is
+    the renderer's job.
+
+    quoted_text is SINGLE-LINE ONLY, pending a quotation contract. A multi-line
+    excerpt is a real thing a specialist may want to cite; this slice rejects it
+    rather than flattening it, because preserving line structure needs an agreed
+    format for how an excerpt is bounded, escaped and rendered, and inventing one
+    here would guess at a contract no consumer has accepted. A rejected quote is
+    honest; a silently flattened one is not.
+
+    TEXT IS NEVER REWRITTEN, in either policy. A sanitising version was tried
+    and rejected: it rewrote the parser's own "; " segment joiner into ",?" on
+    the live path, so an operator read four substitution markers -- the
+    documented signal for "an unsafe character was removed here" -- in a record
+    where nothing hostile had ever been present. A rewrite also makes a record
+    say something the specialist did not. Rejection drops one proposal, reports
+    a bounded code built from a literal and a position, and leaves every
+    surviving string exactly as authored.
+
+    Digest-shaped (64-hex) identifiers are ACCEPTED. An earlier round banned
+    them to keep them out of the minted-id space; that dropped a contract-legal
+    value (a content hash is an obvious way to name a claim) and blamed the
+    model for it. Identity safety comes from the framing below, not from a ban.
+  phase_3b1_repair: |
+    Findings closed after review, each with a reproduction in the test suite:
+
+    computed_at: the original value now goes to execute_batch UNALTERED, so the
+      engine returns its own typed INVALID_INPUT / invalid_computed_at record.
+      Canonicalising up front meant that record could never fire -- a refused
+      clock came back ARITHMETIC_VERIFIED stamped 1970-01-01 with empty errors,
+      warnings and dropped: a verified audit record at a fabricated instant, in
+      a subsystem whose premise is that the record must distinguish what
+      happened. A substitute is used ONLY when an unexpected engine exception
+      forces this module to build records itself, and then `invalid_computed_at`
+      is added to `dropped` so the substitution is never silent.
+
+    revalidation: every proposal is re-validated at the boundary with
+      model_validate. isinstance alone was insufficient -- model_construct
+      bypasses every validator, so an object can BE a CalculationProposal and
+      still carry text the type forbids. (Note model_construct DISCARDS unknown
+      keys outright, so an injected request_id never becomes a field at all.)
+
+    authorization: known_claim_ids is materialised ONCE into a frozenset, and
+      that snapshot is both validated and used. Validating one iteration and
+      building the set from a second let a two-faced collection validate as
+      "c1" and authorise "c9".
+
+    isolation: Correlation construction and ALL proposal-derived work moved
+      inside the per-proposal try. A claim_ref satisfying frozenset membership
+      but not a str raised uncaught and destroyed every sibling.
+
+    logging: literals and a position only. No exception type name (a class name
+      can carry a newline and forge an audit line), no traceback, no model text.
+      An AST test fails if any log call interpolates a computed value.
+
+    text policy: SPLIT in two. Identifiers (claim_ref, operand_id,
+      retrieval_id_hint) are bounded, printable and unpadded -- they are
+      matched, so " c1" and "c1" must not be one id. Descriptive fields
+      (purpose, label, document_label, filename, quoted_text) are bounded and
+      printable and now ALLOW "; ": refusing it coupled this module's input
+      validation to result_contract._join's private output format, so a
+      specialist writing "runway; then covenant headroom" was rejected for a
+      reason unrelated to its own field. Escaping a delimiter is the renderer's
+      job. Nothing is ever rewritten.
+
+  phase_3b1_identity: |
+    mint_request_id() is the only source of request ids. Derived from
+    REQUEST_DOMAIN + case_id + run_id + specialist + position + validated
+    claim_ref + the proposal's canonical JSON content, each component
+    LENGTH-PREFIXED before hashing.
+
+    Length-prefixing, not separator-joining: a plain \x1f join is ambiguous
+    whenever a component can contain the separator, and a probe found a real
+    alias -- ("cfo\x1f0", position 1, claim "x") collided with ("cfo",
+    position 0, claim "1\x1fx"). With a length prefix the pre-image parses back
+    to exactly one tuple whatever any component contains.
+
+    Deterministic in its arguments and nothing else: no clock, no counter, no
+    salt, so a replayed turn produces byte-identical ids. Verified across
+    separate processes under differing PYTHONHASHSEED. `specialist` is inside
+    the pre-image, so two specialists proposing identical arithmetic get
+    different ADDRESSES while their FINGERPRINTS still match -- the arithmetic
+    is the same, the records are separately traceable. claim_ref is included
+    because it distinguishes two calculations; omitting it once let c1 and c2
+    over identical operands mint one id for two attributions.
+  phase_3b1_isolation: |
+    One bad proposal costs its own slot and nothing else. A claim_ref naming no
+    known claim, or a request that fails to construct, drops that proposal and
+    leaves its siblings to execute -- measured: one bad among five good yields
+    five results. Dropped entries are reported as BOUNDED CODES
+    ("proposal_5_unknown_claim_ref"), built from a literal and an index, never
+    from model text.
+
+    No evidence parameter exists. No resolver is wired in 3B1, so every record
+    honestly reports EVIDENCE_UNAVAILABLE and is_verified_evidence() is False.
+    An earlier design accepted a caller-supplied mapping keyed by model-chosen
+    ids, and two specialists that both named a proposal "req-1" shared a
+    binding -- one reported verified evidence over operands no evidence layer
+    had seen.
+
+    No deduplication, no persistence, no shared mutable state (execute_proposals
+    is a function, not an object with a cache), and no narrative handling -- an
+    AST test asserts the gateway never names `narrative` and never imports
+    SpecialistResult. An engine failure returns one typed
+    CALCULATION_UNAVAILABLE record per request rather than nothing, so a reader
+    can tell a calculation nobody asked for from one that could not run.
+  phase_3b1_carried_forward: |
+    Known and NOT fixed in this slice, deliberately:
+      * EvidenceRef.label/filename and Claim.text on result_contract remain
+        unbounded model text. Live but inert -- claims are parsed and then
+        discarded, never rendered. Fixing it means editing the read-only file.
+      * Operand.label and purpose pass into the engine unrewritten, so a label
+        reaches expression_executed as authored. Bounded and screened at the
+        proposal boundary; nothing renders or persists it in this slice.
+      * quoted_text is single-line only. A multi-line excerpt is a real thing a
+        specialist may want to cite, and this slice REJECTS it rather than
+        flattening it: preserving line structure needs a quotation contract
+        saying how an excerpt is bounded, escaped and rendered, and inventing
+        one here would guess at a format no consumer has agreed to. A rejected
+        quote is honest; a flattened one is not.
+      * Correlation still has no validator of its own; case_id/run_id are
+        screened by the gateway instead.
+      * FinanceAgent._last_result remains process-global (SPECIALIST_REGISTRY
+        holds one shared instance). Pre-existing, documented as debug-only.
+      * No cross-specialist dedup: identical arithmetic from two specialists
+        executes twice.
   intent: |
     Deterministic calculation foundation. A controlled single-specialist
     evaluation measured the CFO on three reconciliation checks with all
