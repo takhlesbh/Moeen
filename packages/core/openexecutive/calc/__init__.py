@@ -1,8 +1,11 @@
 """Deterministic calculation contracts — types and authority, no arithmetic.
 
-**Nothing in production imports this package.** It ships as contracts + tests so
-the Phase 2 engine is written against a boundary that already exists and has
-already been reviewed, rather than one it defines for itself while implementing.
+**Production reaches this package through exactly one door.** Only
+``specialists/calculation_gateway.py`` imports the engine or the authority
+module, and only ``agents/finance.py`` calls the gateway (Phase 3B2, behind a
+default-off flag). Everything else imports calc *types* at most. The package
+shipped as contracts + tests first so the engine was written against a boundary
+that already existed and had already been reviewed.
 
 What is here: a closed unit registry with exact conversion factors and real
 dimensions; a numeric boundary that refuses floats, ambiguous separators, NaN,
@@ -16,7 +19,7 @@ Phase 2 adds the engine: :mod:`openexecutive.calc.engine` executes a closed set
 of twelve operations over ``Decimal`` with declared arity and dimensional
 signatures, and :mod:`openexecutive.calc.fingerprint` derives each result's
 identity. Arithmetic now happens here — deterministically, with no model in the
-loop — and nothing in production imports it yet.
+loop.
 
 What is still deliberately **not** here: any expression evaluator, any tool
 schema, any provider call, any filesystem or network access. This package imports only ``json``, ``re``, ``decimal``,

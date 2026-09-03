@@ -4,8 +4,17 @@ CFO is the pilot for replacing the plain-string specialist boundary
 (``BaseAgent.analyze -> str``) with :class:`SpecialistResult`. The migration is
 deliberately one agent wide: ``BaseAgent.analyze`` is untouched, the other nine
 specialists keep using it, and ``route_to_specialist`` still returns ``str``, so
-none of the ~90 call sites across workflows, the MCP tool, or the Executive
+none of the ~100 call sites across workflows, the MCP tool, or the Executive
 change.
+
+Phase 3B2 adds a second public method, :meth:`FinanceAgent.analyze_structured`,
+used only by ``route_parallel`` (via ``route_to_specialist_structured``). It
+returns an application-owned envelope carrying the model's result AND, behind a
+default-off setting, the deterministic calculation gateway's records. Both
+public methods share one private core, :meth:`_analyze_result`, which is the
+single place the provider is called and the parser is run — and which never
+touches the gateway. ``analyze`` therefore cannot reach the gateway by any
+path, because the only call to it lives in a method ``analyze`` never enters.
 
 The override is additive in the strict sense: when the model does not emit the
 tool — the expected case on backends that silently drop ``tool_choice``, which
@@ -15,18 +24,37 @@ structured path either yields claims or costs nothing.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from openexecutive.agents.base import BaseAgent
+from openexecutive.audit.context import get_active_ids
 from openexecutive.config import get_settings
 
 if TYPE_CHECKING:
     from openexecutive.knowledge.retriever import RetrievalSet
+from openexecutive.specialists.calculation_gateway import (
+    MAX_PROPOSALS_PER_CALL,
+    SpecialistCalculations,
+    execute_proposals,
+    is_usable_correlation_id,
+)
 from openexecutive.specialists.result_contract import (
     SpecialistResult,
     emit_specialist_result_tool,
     parse_specialist_result,
     render_for_executive,
+)
+from openexecutive.specialists.routed_output import (
+    CALC_CLAIM_SET_UNSAFE,
+    CALC_CONTEXT_UNAVAILABLE,
+    CALC_DISABLED,
+    CALC_GATEWAY_RAISED,
+    CALC_NO_PROPOSALS,
+    CALC_SKIPPED_STRUCTURE_LOST,
+    CALC_TOO_MANY_PROPOSALS,
+    CorrelationFrame,
+    RoutedSpecialistOutput,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +81,12 @@ class FinanceAgent(BaseAgent):
     # Agents that do not declare it keep the legacy string path unchanged.
     accepts_retrieval_set = True
 
+    # Capability flag read by ``orchestrator.router``: ``route_parallel``
+    # dispatches this agent through ``analyze_structured`` and receives the
+    # envelope. ``route_to_specialist`` — every workflow, the MCP tool, the
+    # Council sandbox — still calls ``analyze`` and still gets a string.
+    emits_structured_result = True
+
     @property
     def model(self) -> str:  # type: ignore[override]
         return get_settings().deep_reasoning_model
@@ -63,7 +97,7 @@ class FinanceAgent(BaseAgent):
         return CFO_PROMPT
 
     # ------------------------------------------------------------------
-    # structured path
+    # structured path — legacy string boundary
     # ------------------------------------------------------------------
 
     async def analyze(  # type: ignore[override]
@@ -98,10 +132,10 @@ class FinanceAgent(BaseAgent):
         validate against another turn's retrieval — a cross-request provenance
         forgery that needs no hostile model to trigger, just two users at once.
 
-        The structured result is parsed and kept for the duration of the call —
-        :attr:`last_result` — but only its narrative crosses the boundary. The
-        Executive's ``results_by_id`` and ``tool_result`` content are unchanged;
-        exposing claims is a later slice.
+        This method never advertises ``calculation_requests`` and never calls
+        the calculation gateway: it hands ``_analyze_result`` a hard ``False``,
+        so the parser treats the key as unknown exactly as it does today, and
+        the only gateway call in this class lives in ``analyze_structured``.
         """
         if system_prompt_override is not None:
             # analyze_with_tools takes an *addendum* appended to this agent's own
@@ -127,6 +161,114 @@ class FinanceAgent(BaseAgent):
                 deep_reasoning_override=deep_reasoning_override,
             )
 
+        result, message = await self._analyze_result(
+            query,
+            context,
+            retrieved_knowledge,
+            episodic_context,
+            failure_cases,
+            department_memory,
+            model_override=model_override,
+            deep_reasoning_override=deep_reasoning_override,
+            retrieval_set=retrieval_set,
+            calculation_requests=False,
+        )
+        return self._narrative_for(result, message)
+
+    # ------------------------------------------------------------------
+    # structured path — envelope boundary (route_parallel only)
+    # ------------------------------------------------------------------
+
+    async def analyze_structured(
+        self,
+        query: str,
+        context: str = "",
+        retrieved_knowledge: str = "",
+        episodic_context: str = "",
+        failure_cases: str = "",
+        department_memory: str = "",
+        *,
+        model_override: str | None = None,
+        deep_reasoning_override: bool | None = None,
+        retrieval_set: RetrievalSet | None = None,
+    ) -> RoutedSpecialistOutput:
+        """Run CFO's analysis and return the application-owned envelope.
+
+        Called only by ``route_to_specialist_structured``. There is deliberately
+        no ``system_prompt_override`` parameter: the router has none to pass,
+        and the Council sandbox — the one caller that overrides prompts — uses
+        ``analyze``.
+
+        ``narrative`` is produced by the same rule ``analyze`` uses, so the
+        Executive and the Committee receive exactly the bytes they receive from
+        the legacy path. The calculation gateway runs only when every gate in
+        :meth:`_gated_calculations` passes, and its records are returned in the
+        envelope — the asyncio task result — never via shared state.
+        """
+        enabled = bool(get_settings().calc_cfo_structured_enabled)
+        result, message = await self._analyze_result(
+            query,
+            context,
+            retrieved_knowledge,
+            episodic_context,
+            failure_cases,
+            department_memory,
+            model_override=model_override,
+            deep_reasoning_override=deep_reasoning_override,
+            retrieval_set=retrieval_set,
+            calculation_requests=enabled,
+        )
+        narrative = self._narrative_for(result, message)
+        calculations, frame, diagnostics = self._gated_calculations(result, enabled)
+        return RoutedSpecialistOutput(
+            specialist=self.name,
+            narrative=narrative,
+            specialist_result=result,
+            calculations=calculations,
+            frame=frame,
+            diagnostics=diagnostics,
+        )
+
+    @property
+    def last_result(self) -> SpecialistResult | None:
+        """The structured result from the most recent :meth:`analyze` call.
+
+        Read-only, and a debugging/test affordance only — never a data channel.
+        Two properties a caller must know: ``SPECIALIST_REGISTRY`` holds one
+        shared ``FinanceAgent``, so concurrent turns overwrite this and whichever
+        finishes last wins (the returned strings are unaffected — all real state
+        is call-local); and the last result, which may carry company-confidential
+        figures, is retained on that process-global object until the next CFO
+        call replaces it. Nothing in production reads it, and no route serializes
+        agent state, so it is not exposed today.
+        """
+        return getattr(self, "_last_result", None)
+
+    # ------------------------------------------------------------------
+    # shared core
+    # ------------------------------------------------------------------
+
+    async def _analyze_result(
+        self,
+        query: str,
+        context: str,
+        retrieved_knowledge: str,
+        episodic_context: str,
+        failure_cases: str,
+        department_memory: str,
+        *,
+        model_override: str | None,
+        deep_reasoning_override: bool | None,
+        retrieval_set: RetrievalSet | None,
+        calculation_requests: bool,
+    ) -> tuple[SpecialistResult, Any]:
+        """The ONE provider call, then the parser. Never the gateway.
+
+        ``calculation_requests`` is threaded to both the tool factory and the
+        parser so the schema the model saw and the keys the parser accepts can
+        never disagree. Returns the raw message alongside the result because
+        the legacy narrative rule needs the message's first text block.
+        """
         message = await self.analyze_with_tools(
             self._build_user_content(
                 query,
@@ -136,7 +278,11 @@ class FinanceAgent(BaseAgent):
                 failure_cases=failure_cases,
                 department_memory=department_memory,
             ),
-            tools=[emit_specialist_result_tool()],
+            tools=[
+                emit_specialist_result_tool(
+                    include_calculation_requests=calculation_requests
+                )
+            ],
             max_tokens=self._max_tokens(),
             model_override=model_override,
             deep_reasoning_override=self._effective_deep_reasoning(
@@ -159,9 +305,13 @@ class FinanceAgent(BaseAgent):
             specialist=self.name,
             model=resolved_model,
             allowed_retrieval_ids=allowed_ids,
+            accept_calculation_requests=calculation_requests,
         )
         self._last_result = result
+        return result, message
 
+    def _narrative_for(self, result: SpecialistResult, message: Any) -> str:
+        """The legacy string for this call. One rule, shared by both paths."""
         if result.degraded:
             logger.info(
                 "cfo: structured output degraded (%s); returning legacy text",
@@ -191,20 +341,73 @@ class FinanceAgent(BaseAgent):
 
         return render_for_executive(result)
 
-    @property
-    def last_result(self) -> SpecialistResult | None:
-        """The structured result from the most recent :meth:`analyze` call.
+    def _gated_calculations(
+        self, result: SpecialistResult, enabled: bool
+    ) -> tuple[SpecialistCalculations | None, CorrelationFrame | None, tuple[str, ...]]:
+        """Run the gateway iff every gate passes; otherwise say which one did not.
 
-        Read-only, and a debugging/test affordance only — never a data channel.
-        Two properties a caller must know: ``SPECIALIST_REGISTRY`` holds one
-        shared ``FinanceAgent``, so concurrent turns overwrite this and whichever
-        finishes last wins (the returned strings are unaffected — all real state
-        is call-local); and the last result, which may carry company-confidential
-        figures, is retained on that process-global object until the next CFO
-        call replaces it. Nothing in production reads it, and no route serializes
-        agent state, so it is not exposed today.
+        Gates, in order, each failing CLOSED with a literal diagnostic:
+
+        * the setting is off;
+        * the parser reached its lost-structure exit — no claim set exists to
+          authorize against, and no proposal survives that exit anyway;
+        * the model proposed nothing;
+        * the model proposed more than the engine's batch limit. A declared
+          condition, reported under its own code: the gateway would raise on
+          it, and a model-controlled count must not read as an engine crash;
+        * the audit context holds no usable session/turn identity. There is no
+          constant fallback: a request id minted under ``"unbound_run"`` would be
+          an audit record that looks correlated and is not;
+        * a final ``claim_id`` is not a usable identifier. The whole set is
+          refused rather than filtered — partial authorization is not a thing
+          this method offers. (``Claim.claim_id`` is only ``min_length=1``; the
+          gateway would raise on such a member, and that must never become a
+          way for model output to fail the turn.)
+
+        ``known_claim_ids`` is derived from ``result.claims`` — the FINAL,
+        constructor-validated set — never from the raw payload, so a
+        ``claim_ref`` naming a claim the parser dropped cannot be authorized.
+        The gateway call is wrapped so that a raise there is contained as a
+        diagnostic rather than propagating into ``route_parallel``, which today
+        has no handler and would fail the whole turn.
         """
-        return getattr(self, "_last_result", None)
+        if not enabled:
+            return None, None, (CALC_DISABLED,)
+        if result.integrity == "lost":
+            return None, None, (CALC_SKIPPED_STRUCTURE_LOST,)
+        if not result.calculation_requests:
+            return None, None, (CALC_NO_PROPOSALS,)
+        if len(result.calculation_requests) > MAX_PROPOSALS_PER_CALL:
+            return None, None, (CALC_TOO_MANY_PROPOSALS,)
+        case_id, run_id = get_active_ids()
+        if not (is_usable_correlation_id(case_id) and is_usable_correlation_id(run_id)):
+            return None, None, (CALC_CONTEXT_UNAVAILABLE,)
+        assert case_id is not None and run_id is not None  # narrowed above
+        known = frozenset(claim.claim_id for claim in result.claims)
+        if not all(is_usable_correlation_id(claim_id) for claim_id in known):
+            return None, None, (CALC_CLAIM_SET_UNSAFE,)
+        frame = CorrelationFrame(
+            case_id=case_id,
+            run_id=run_id,
+            # Passed to the engine AS GIVEN; a clock the engine refuses comes
+            # back as its own typed INVALID_INPUT record, never a substitute.
+            computed_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        try:
+            calculations = execute_proposals(
+                specialist=self.name,
+                proposals=result.calculation_requests,
+                case_id=frame.case_id,
+                run_id=frame.run_id,
+                computed_at=frame.computed_at,
+                known_claim_ids=known,
+            )
+        except Exception:  # noqa: BLE001 - never a new turn-failure path
+            # A literal only. No exception text and no model text reach the
+            # log from here, matching the gateway's own logging rule.
+            logger.warning("cfo: calculation gateway raised")
+            return None, frame, (CALC_GATEWAY_RAISED,)
+        return calculations, frame, ()
 
     # ------------------------------------------------------------------
     # helpers

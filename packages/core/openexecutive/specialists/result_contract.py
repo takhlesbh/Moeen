@@ -53,6 +53,11 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from openexecutive.specialists.calculation_proposal import (
+    CALCULATION_REQUESTS_SCHEMA,
+    CalculationProposal,
+)
+
 logger = logging.getLogger(__name__)
 
 # What kind of statement a claim is. The Executive needs this to weigh claims
@@ -99,6 +104,26 @@ VerificationStatus = Literal[
     "refuted",
     "not_applicable",
 ]
+
+# Which exit of ``parse_specialist_result`` produced a result. PARSER-AUTHORED
+# metadata, like ``degraded`` and ``degraded_reason``: it is not in the tool
+# schema, not an accepted payload key, and a model that writes it into its
+# payload gets an unknown-key degradation. Three values, one per exit:
+#
+#   intact   the clean exit — every claim validated, nothing lost;
+#   partial  structure was readable but incomplete; the claims that are
+#            present passed the full constructor (unique ids, resolved
+#            conflicts) and only THEY are authoritative for anything that
+#            authorizes against a claim id;
+#   lost     the ``_degraded`` exit — claims are (), proposals are (), and
+#            nothing about the model's structure survived.
+#
+# The boolean ``degraded`` cannot carry this: ``partial`` and ``lost`` are both
+# degraded, and ``claims == ()`` does not separate them either, because a
+# partial result with an unknown key and zero claims is legitimately empty AND
+# trustworthy. Consumers that authorize against the claim set (the calculation
+# gateway caller) key on this field, never on ``degraded``.
+ParseIntegrity = Literal["intact", "partial", "lost"]
 
 # Shared config for every model here. ``frozen`` is the load-bearing half — see
 # rule 3 in the module docstring. ``extra="forbid"`` makes an off-schema field a
@@ -349,6 +374,51 @@ class SpecialistResult(_ContractModel):
     degraded: bool = False
     degraded_reason: str | None = None
 
+    # Model-owned INTENT: what the specialist asked to have computed. A
+    # ``CalculationProposal`` has no field for a result, status, id, timestamp,
+    # fingerprint or evidence and is ``extra="forbid"``, so nothing on this
+    # object can carry an answer. Engine records never live here — they ride on
+    # the application-owned envelope (``specialists/routed_output.py``) so that
+    # "what the model said" and "what the application computed" stay two types.
+    calculation_requests: tuple[CalculationProposal, ...] = ()
+
+    # Parser-authored; see ``ParseIntegrity``. ``None`` at construction derives
+    # from ``degraded`` (``partial`` if degraded else ``intact``) so a
+    # hand-built result never reads as intact while degraded; ``lost`` is only
+    # ever set explicitly by the parser's ``_degraded`` exit.
+    integrity: ParseIntegrity | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_integrity_when_absent(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("integrity") is None:
+            data = dict(data)
+            data["integrity"] = "partial" if data.get("degraded") else "intact"
+        return data
+
+    @model_validator(mode="after")
+    def _integrity_agrees_with_degradation(self) -> SpecialistResult:
+        """The three exits are mutually exclusive and each implies its shape.
+
+        ``lost`` with a surviving claim or proposal would let the gateway caller
+        authorize against structure the parser had already declared unusable;
+        ``intact`` while degraded would let a hand-built result bypass the
+        degraded rendering rule. Both are refused at construction.
+        """
+        if self.integrity == "lost":
+            if not self.degraded:
+                raise ValueError("integrity 'lost' requires degraded=True")
+            if self.claims or self.calculation_requests:
+                raise ValueError(
+                    "integrity 'lost' carries no claims and no calculation_requests"
+                )
+        elif self.integrity == "partial":
+            if not self.degraded:
+                raise ValueError("integrity 'partial' requires degraded=True")
+        elif self.degraded:
+            raise ValueError("integrity 'intact' requires degraded=False")
+        return self
+
     @model_validator(mode="after")
     def _claim_ids_unique(self) -> SpecialistResult:
         seen: set[str] = set()
@@ -559,8 +629,20 @@ EMIT_SPECIALIST_RESULT_TOOL: dict[str, Any] = {
 }
 
 
-def emit_specialist_result_tool() -> dict[str, Any]:
+def emit_specialist_result_tool(
+    *, include_calculation_requests: bool = False
+) -> dict[str, Any]:
     """A fresh, independent copy of the tool schema, safe to hand to a provider.
+
+    ``include_calculation_requests`` is the Phase 3B2 flag at the wire. The
+    default is **byte-identical** to the schema before the flag existed — the
+    module constant is never touched, so the ~20 tests that read it keep their
+    template, and a caller that does not opt in sends exactly the bytes it sent
+    before (pinned by hash in the test suite). Opting in adds one property,
+    inserted at its **sorted** position so the cached tool block stays
+    byte-stable; ``required`` is unchanged. The only production caller that
+    passes ``True`` is ``FinanceAgent.analyze_structured`` when the setting is
+    on; ``FinanceAgent.analyze`` never does.
 
     Use this rather than the module constant at any call site. The constant is a
     plain nested dict, so the usual idiom for tagging a tool —
@@ -575,7 +657,17 @@ def emit_specialist_result_tool() -> dict[str, Any]:
     and the constant stays exported so existing tests can assert against the
     canonical template.
     """
-    return deepcopy(EMIT_SPECIALIST_RESULT_TOOL)
+    tool = deepcopy(EMIT_SPECIALIST_RESULT_TOOL)
+    if include_calculation_requests:
+        properties = tool["input_schema"]["properties"]
+        properties["calculation_requests"] = deepcopy(CALCULATION_REQUESTS_SCHEMA)
+        # Rebuilt in sorted order rather than appended: dict order is what the
+        # provider serialises, and an out-of-order key invalidates the cached
+        # prefix for every subsequent request.
+        tool["input_schema"]["properties"] = {
+            name: properties[name] for name in sorted(properties)
+        }
+    return tool
 
 
 # Fields the model is never allowed to populate, even if it invents them. The
@@ -948,6 +1040,11 @@ def _safe_path_part(part: Any) -> str:
 # structure this module did not read — see the `unknown key` problem below.
 _KNOWN_PAYLOAD_KEYS = frozenset({"narrative", "claims"})
 
+# The one additional key accepted ONLY when the caller opted the schema in. With
+# the flag off it stays unknown, so a model emitting it unprompted gets today's
+# unknown-key degradation rather than a silently parsed proposal.
+_CALCULATION_REQUESTS_KEY = "calculation_requests"
+
 # Stand-in when a caller passes an unusable specialist name. The parser's whole
 # job is to not raise, so it must be able to build a degraded result even when
 # its own arguments are wrong.
@@ -977,7 +1074,40 @@ def _degraded(
         model=model if isinstance(model, str) else "",
         degraded=True,
         degraded_reason=reason or "structured output unavailable",
+        integrity="lost",
     )
+
+
+def _scrub_calculation_requests(
+    raw: Any,
+) -> tuple[list[CalculationProposal], list[str]]:
+    """Validate each proposed calculation INDEPENDENTLY, dropping only the bad.
+
+    One malformed entry costs itself and nothing else — the same isolation rule
+    the gateway applies one step later. The count is reported, the content is
+    not: a rejected entry is model text of unbounded length, and this reason is
+    logged, persisted and surfaced. ``model_validate`` runs the full
+    ``CalculationProposal`` screen (bounded, printable, unpadded identifiers;
+    ``extra="forbid"``), so an entry attempting a ``request_id``, a result, a
+    status or a timestamp is refused here and counted as unreadable.
+    """
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], [f"calculation_requests was {type(raw).__name__}, expected array"]
+    proposals: list[CalculationProposal] = []
+    unreadable = 0
+    for item in raw:
+        try:
+            proposals.append(CalculationProposal.model_validate(item))
+        except ValidationError:
+            unreadable += 1
+        except Exception:  # noqa: BLE001 - a hostile item must not raise
+            unreadable += 1
+    problems = (
+        [f"{unreadable} calculation request(s) could not be read"] if unreadable else []
+    )
+    return proposals, problems
 
 
 def parse_specialist_result(
@@ -986,8 +1116,20 @@ def parse_specialist_result(
     specialist: str,
     model: str = "",
     allowed_retrieval_ids: frozenset[str] | None = None,
+    accept_calculation_requests: bool = False,
 ) -> SpecialistResult:
     """Turn a provider message into a :class:`SpecialistResult`.
+
+    ``accept_calculation_requests`` mirrors the tool factory's flag. ``False``
+    (the default, and every legacy caller) leaves ``calculation_requests`` an
+    unknown key — exactly today's degradation. ``True`` parses it, entry by
+    entry, into model-owned proposals. Only ``FinanceAgent.analyze_structured``
+    passes ``True``, and only when the setting is on.
+
+    The result's ``integrity`` names which of this function's three exits
+    produced it: ``lost`` from :func:`_degraded` (claims and proposals both
+    empty), ``partial`` when structure was readable but something was dropped,
+    ``intact`` otherwise. Nothing in the payload can select it.
 
     Never raises for bad model output. A specialist that returns something
     unexpected must not take down the Executive's tool loop, so every failure
@@ -1037,7 +1179,10 @@ def parse_specialist_result(
         # capitalisation slip, or an instruction planted in an indexed
         # document) would hand the Executive claims=() with degraded=False,
         # which reads as "the specialist genuinely made no claims".
-        unknown_keys = set(payload) - _KNOWN_PAYLOAD_KEYS
+        known_keys = _KNOWN_PAYLOAD_KEYS
+        if accept_calculation_requests:
+            known_keys = known_keys | {_CALCULATION_REQUESTS_KEY}
+        unknown_keys = set(payload) - known_keys
         if unknown_keys:
             # The COUNT, never the keys. A key is model-authored text, and the
             # claim-level path already refuses to echo one (``<extra>`` in
@@ -1107,12 +1252,21 @@ def parse_specialist_result(
             if dropped:
                 problems.append(f"{dropped} claim entr(y/ies) were not objects")
 
+        proposals: list[CalculationProposal] = []
+        if accept_calculation_requests:
+            proposals, proposal_problems = _scrub_calculation_requests(
+                payload.get(_CALCULATION_REQUESTS_KEY)
+            )
+            problems.extend(proposal_problems)
+
         try:
             result = SpecialistResult(
                 specialist=specialist,
                 narrative=narrative,
                 claims=claims,  # type: ignore[arg-type]
                 model=model,
+                calculation_requests=tuple(proposals),
+                integrity="intact",
             )
         except ValidationError as exc:
             # Deliberately NOT ``exc``: ``str(ValidationError)`` embeds the raw
@@ -1148,6 +1302,8 @@ def parse_specialist_result(
                 model=model,
                 degraded=True,
                 degraded_reason=_join(problems),
+                calculation_requests=result.calculation_requests,
+                integrity="partial",
             )
         return result
 

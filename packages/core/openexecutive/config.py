@@ -92,6 +92,16 @@ class Settings(BaseSettings):
     max_parallel_specialists: int = Field(0, alias="MAX_PARALLEL_SPECIALISTS")
 
     # ---- OpenRouter routing --------------------------------------------
+    # Phase 3B2 controlled trial: lets the CFO's STRUCTURED routing path
+    # advertise `calculation_requests` in its tool schema and hand the model's
+    # proposals to the deterministic calculation gateway. Default OFF so the
+    # tool schema the CFO receives is byte-identical to before this flag
+    # existed. Read in exactly one place: FinanceAgent.analyze_structured.
+    # FinanceAgent.analyze (the 100+ legacy call sites) never reads it.
+    calc_cfo_structured_enabled: bool = Field(
+        False, alias="CALC_CFO_STRUCTURED_ENABLED"
+    )
+
     # Toggle that routes Claude calls through OpenRouter (so usage is
     # billed to your OpenRouter account) and unlocks the curated set of
     # non-Anthropic models in the Council UI. Default OFF so a fresh

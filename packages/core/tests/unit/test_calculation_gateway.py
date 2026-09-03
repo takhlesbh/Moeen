@@ -1,8 +1,10 @@
 """The gateway: minted identity, one engine call, and nothing else.
 
-It is deliberately unwired — nothing in production constructs it in this slice —
-so these tests are the whole of its evidence. The CFO-path tests below verify
-the live boundary is *untouched*, which is the other half of the claim.
+Phase 3B2 gave it exactly one production caller, ``FinanceAgent`` on the
+structured routing path, behind a default-off setting. The structural tests
+below pin the two one-door invariants that replaced the earlier "unwired"
+assertions: only the gateway imports the engine, and only ``finance.py`` calls
+the gateway.
 """
 from __future__ import annotations
 
@@ -150,8 +152,11 @@ def test_the_cfo_parser_reason_format_is_unchanged() -> None:
     assert "?" not in parsed.degraded_reason
 
 
-def test_specialist_result_has_no_calculation_or_result_field() -> None:
-    for forbidden in ("calculations", "calculation_requests", "results"):
+def test_specialist_result_carries_intent_but_never_a_record() -> None:
+    """``calculation_requests`` is model-owned INTENT and lives on the result;
+    an engine record never does — those ride on the application-owned envelope."""
+    assert "calculation_requests" in SpecialistResult.model_fields
+    for forbidden in ("calculations", "results", "calculation_results", "requests"):
         assert forbidden not in SpecialistResult.model_fields
 
 
@@ -183,16 +188,21 @@ def test_the_protected_modules_declare_no_calculation_surface() -> None:
     These four assertions hold at any commit, in any checkout, with or without
     git installed.
     """
-    # 1. The model-authored result type carries no calculation surface.
-    for forbidden in ("calculations", "calculation_requests", "results", "proposals"):
+    # 1. The model-authored result type carries no calculation RECORD.
+    for forbidden in ("calculations", "results", "calculation_results", "proposals"):
         assert forbidden not in SpecialistResult.model_fields
 
-    # 2. The live CFO path does not reach the new modules.
-    for relative in ("agents/finance.py", "orchestrator/router.py"):
-        source = (PACKAGE_ROOT / relative).read_text(encoding="utf-8")
-        assert "calculation_gateway" not in source, relative
-        assert "calculation_proposal" not in source, relative
-        assert "execute_proposals" not in source, relative
+    # 2. Door B: finance.py reaches the gateway and ONLY the gateway. It never
+    #    names the engine, the authority module, or the calc package at all.
+    finance = (PACKAGE_ROOT / "agents" / "finance.py").read_text(encoding="utf-8")
+    assert "calculation_gateway" in finance
+    for absent in ("openexecutive.calc", "calc.engine", "calc.authority",
+                   "execute_batch", "issue_calculation_result"):
+        assert absent not in finance, f"finance.py references {absent}"
+    # The router never touches either calc module: it dispatches by capability.
+    router = (PACKAGE_ROOT / "orchestrator" / "router.py").read_text(encoding="utf-8")
+    for absent in ("calculation_gateway", "calculation_proposal", "execute_proposals"):
+        assert absent not in router, f"router.py references {absent}"
 
     # 3. calc stays a leaf: it imports nothing from specialists. Resolved with
     #    the shared resolver, so ``from .. import specialists`` is attributed to
@@ -230,11 +240,13 @@ def test_the_specialist_parser_module_has_no_calculation_validator() -> None:
     source = (PACKAGE_ROOT / "specialists" / "result_contract.py").read_text(
         encoding="utf-8"
     )
+    # It may name the PROPOSAL type (model-owned intent lives on the result);
+    # it must never name the gateway, a record type, or the executor.
     for absent in (
         "calculation_gateway",
-        "calculation_proposal",
         "CalculationResult",
-        "CalculationProposal",
+        "SpecialistCalculations",
+        "execute_proposals",
         "is_safe_text",
     ):
         assert absent not in source, f"result_contract.py references {absent}"
@@ -683,18 +695,61 @@ def test_the_repository_allowlists_pass_unmodified() -> None:
 
 
 
-def test_the_gateway_is_not_wired_into_production() -> None:
-    """Deliberately unwired: unconsumed work on a live path is cost and risk."""
-    importers = []
+def test_the_gateway_has_exactly_the_expected_referrers() -> None:
+    """Every production module that so much as names either calc-specialist file.
+
+    ``result_contract`` names the proposal type (intent on the result),
+    ``routed_output`` names the record container (the envelope), and
+    ``finance`` is the one caller. Anything else appearing here is a widening
+    that needs a review, not a green run.
+    """
+    referrers = []
     for path in PACKAGE_ROOT.rglob("*.py"):
         if path.name in ("calculation_gateway.py", "calculation_proposal.py"):
             continue
         if "__pycache__" in path.parts:
             continue
+        # calc/ is a leaf and cannot import specialists (assertion 3 above);
+        # its package docstring merely NAMES the gateway as the one door.
+        if path.relative_to(PACKAGE_ROOT).parts[0] == "calc":
+            continue
         text = path.read_text(encoding="utf-8")
         if "calculation_gateway" in text or "calculation_proposal" in text:
-            importers.append(path.relative_to(PACKAGE_ROOT).as_posix())
-    assert importers == []
+            referrers.append(path.relative_to(PACKAGE_ROOT).as_posix())
+    assert sorted(referrers) == [
+        "agents/finance.py",
+        "specialists/result_contract.py",
+        "specialists/routed_output.py",
+    ]
+
+
+def _execute_proposals_callers() -> list[str]:
+    """Door B, resolved on the AST: every production call of ``execute_proposals``.
+
+    A call is ``execute_proposals(...)`` or ``<anything>.execute_proposals(...)``.
+    Text search would also match the docstrings that explain the rule.
+    """
+    callers: list[str] = []
+    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        if "__pycache__" in path.parts or path.name == "calculation_gateway.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else (
+                func.attr if isinstance(func, ast.Attribute) else None
+            )
+            if name == "execute_proposals":
+                callers.append(path.relative_to(PACKAGE_ROOT).as_posix())
+                break
+    return callers
+
+
+def test_exactly_one_production_module_calls_the_gateway() -> None:
+    """Door B: ``agents/finance.py`` is the only caller of ``execute_proposals``."""
+    assert _execute_proposals_callers() == ["agents/finance.py"]
 
 
 def test_the_new_modules_stay_within_the_production_budget() -> None:
@@ -702,7 +757,9 @@ def test_the_new_modules_stay_within_the_production_budget() -> None:
         len((PACKAGE_ROOT / "specialists" / name).read_text(encoding="utf-8").splitlines())
         for name in ("calculation_proposal.py", "calculation_gateway.py")
     )
-    assert lines <= 560, f"{lines} production lines exceeds the budget"
+    # Raised from 560 in Phase 3B2 for the proposal module's wire-schema
+    # constant (~90 lines) and the gateway's one-line id screen.
+    assert lines <= 680, f"{lines} production lines exceeds the budget"
 
 
 def test_the_result_types_are_reused_not_redefined() -> None:
