@@ -58,6 +58,11 @@ def test_sections_have_unique_stable_ids() -> None:
         # `clients` — named client-company slots for fractional / multi-client
         # use (save-back switching, per-client MCP config). New top-level module.
         "clients",
+        # `calc` — deterministic calculation contracts: typed request/result
+        # types, the closed unit registry, and the authority boundary. Contracts
+        # only; no arithmetic engine and no production caller yet. New
+        # top-level module.
+        "calc",
     ]
 
 
