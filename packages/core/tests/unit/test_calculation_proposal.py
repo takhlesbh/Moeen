@@ -310,3 +310,80 @@ def test_operands_are_bounded_and_unique() -> None:
 def test_an_unknown_operation_is_refused() -> None:
     with pytest.raises(ValidationError):
         _proposal(operation="exec_arbitrary_code")
+
+
+# ---------------------------------------------------------------------------
+# The wire schema mirrors the model — Phase 3B2
+# ---------------------------------------------------------------------------
+
+
+def _schema_props(node: dict) -> dict:  # type: ignore[type-arg]
+    return node["properties"]  # type: ignore[no-any-return]
+
+
+def test_wire_schema_properties_equal_the_model_fields() -> None:
+    """Every proposal field is on the wire and nothing else is."""
+    import json
+
+    from openexecutive.calc.contract import Operand, SourceHint
+    from openexecutive.specialists.calculation_proposal import (
+        CALCULATION_REQUESTS_SCHEMA,
+    )
+
+    item = CALCULATION_REQUESTS_SCHEMA["items"]
+    assert set(_schema_props(item)) == set(CalculationProposal.model_fields)
+    operand = _schema_props(item)["operands"]["items"]
+    assert set(_schema_props(operand)) == set(Operand.model_fields)
+    hint = _schema_props(operand)["source_hint"]
+    assert set(_schema_props(hint)) == set(SourceHint.model_fields)
+    # Nothing a model could use to assert an answer, an id or a status.
+    serialized = json.dumps(CALCULATION_REQUESTS_SCHEMA)
+    for forbidden in (
+        "request_id", "correlation", "result", "status", "fingerprint",
+        "computed_at", "authority", "evidence", "verified", "integrity",
+    ):
+        assert f'"{forbidden}"' not in serialized, forbidden
+
+
+def test_wire_schema_enums_are_derived_from_the_contract_literals() -> None:
+    from typing import get_args
+
+    from openexecutive.calc.contract import (
+        OperandBasis,
+        OperandRole,
+        OperationId,
+        RoundingMode,
+    )
+    from openexecutive.calc.numeric import NumberFormat
+    from openexecutive.specialists.calculation_proposal import (
+        CALCULATION_REQUESTS_SCHEMA,
+    )
+
+    item = _schema_props(CALCULATION_REQUESTS_SCHEMA["items"])
+    operand = _schema_props(item["operands"]["items"])
+    assert item["operation"]["enum"] == list(get_args(OperationId))
+    assert item["rounding"]["enum"] == list(get_args(RoundingMode))
+    assert operand["basis"]["enum"] == list(get_args(OperandBasis))
+    assert operand["role"]["enum"] == list(get_args(OperandRole))
+    assert operand["number_format"]["enum"] == list(get_args(NumberFormat))
+
+
+def test_wire_schema_properties_are_sorted_for_cache_stability() -> None:
+    from openexecutive.specialists.calculation_proposal import (
+        CALCULATION_REQUESTS_SCHEMA,
+    )
+
+    def _check(node: object) -> None:
+        if not isinstance(node, dict):
+            return
+        props = node.get("properties")
+        if isinstance(props, dict):
+            assert list(props) == sorted(props), list(props)
+        for value in node.values():
+            if isinstance(value, dict):
+                _check(value)
+            elif isinstance(value, list):
+                for entry in value:
+                    _check(entry)
+
+    _check(CALCULATION_REQUESTS_SCHEMA)

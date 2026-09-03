@@ -19,6 +19,7 @@ from openexecutive.agents.product import ProductAgent
 from openexecutive.agents.strategy import StrategyAgent
 from openexecutive.agents.talent import TalentAgent
 from openexecutive.agents.triage import TriageAgent
+from openexecutive.specialists.routed_output import RoutedSpecialistOutput
 
 SPECIALIST_REGISTRY: dict[str, BaseAgent] = {
     "cso": StrategyAgent(),
@@ -88,6 +89,16 @@ def _accepts_retrieval_set(agent: BaseAgent) -> bool:
     return bool(getattr(agent, "accepts_retrieval_set", False))
 
 
+def _emits_structured_result(agent: BaseAgent) -> bool:
+    """Whether ``agent`` exposes ``analyze_structured`` for ``route_parallel``.
+
+    Same capability-flag idiom as :func:`_accepts_retrieval_set`, and for the
+    same reason: no agent import here, so a second structured specialist is a
+    one-line change on the agent and none on the router.
+    """
+    return bool(getattr(agent, "emits_structured_result", False))
+
+
 async def route_to_specialist(
     specialist_name: str,
     query: str,
@@ -127,6 +138,56 @@ async def route_to_specialist(
         department_memory=department_memory,
         **kwargs,
     )
+
+
+async def route_to_specialist_structured(
+    specialist_name: str,
+    query: str,
+    context: str = "",
+    retrieved_knowledge: str = "",
+    episodic_context: str = "",
+    failure_cases: str = "",
+    department_memory: str = "",
+    *,
+    retrieval_set: RetrievalSet | None = None,
+) -> RoutedSpecialistOutput:
+    """Dispatch one specialist call and return the application-owned envelope.
+
+    Used by :func:`route_parallel` only. A specialist that declares
+    ``emits_structured_result`` is dispatched through its ``analyze_structured``
+    and its envelope is returned as-is. Every other specialist — and an unknown
+    name — goes through :func:`route_to_specialist` itself, so the string in
+    the envelope is produced by the legacy code path, byte for byte, rather
+    than re-implemented here.
+
+    Failure semantics are unchanged: nothing is caught. An exception from a
+    specialist propagates exactly as it did when this function did not exist.
+    """
+    agent = SPECIALIST_REGISTRY.get(specialist_name)
+    if agent is not None and _emits_structured_result(agent):
+        kwargs: dict[str, Any] = {}
+        if retrieval_set is not None and _accepts_retrieval_set(agent):
+            kwargs["retrieval_set"] = retrieval_set
+        return await agent.analyze_structured(  # type: ignore[attr-defined, no-any-return]
+            query=query,
+            context=context,
+            retrieved_knowledge=retrieved_knowledge,
+            episodic_context=episodic_context,
+            failure_cases=failure_cases,
+            department_memory=department_memory,
+            **kwargs,
+        )
+    text = await route_to_specialist(
+        specialist_name,
+        query,
+        context,
+        retrieved_knowledge,
+        episodic_context,
+        failure_cases,
+        department_memory,
+        retrieval_set=retrieval_set,
+    )
+    return RoutedSpecialistOutput(specialist=specialist_name, narrative=text)
 
 
 # Tool_result returned for consult_specialist calls past the per-turn fan-out
@@ -241,8 +302,15 @@ async def route_parallel(
     episodic_context: str = "",
     session_id: str | None = None,
     debug_collector: DebugCollector | None = None,
-) -> list[str]:
+) -> list[RoutedSpecialistOutput]:
     """Execute multiple specialist calls concurrently.
+
+    Returns one :class:`RoutedSpecialistOutput` per call, in call order. The
+    envelope is the asyncio **task result** of each gathered child — the one
+    channel that reads correctly in the awaiting parent (a ContextVar set in a
+    child is invisible here) and fails *empty* rather than *stale*. Its
+    ``narrative`` is exactly the string this function returned before the
+    envelope existed; the Executive reads that field and nothing else.
 
     Each specialist receives its own domain-filtered RAG context, fetched
     in parallel before the LLM calls fire. Callers may still supply a
@@ -260,8 +328,9 @@ async def route_parallel(
     representation; specialists without an owning department (e.g.
     ``triage``) skip the prefetch entirely.
 
-    Returns results in the same order as ``calls`` so callers can zip
-    with tool_use_ids.
+    Results are in the same order as ``calls`` so callers can zip with
+    tool_use_ids. Exception handling is unchanged: ``gather`` without
+    ``return_exceptions``, so one failing specialist still fails the batch.
     """
     retrieval_sets: list[RetrievalSet | None]
     if retrieved_knowledge_map is None:
@@ -296,7 +365,7 @@ async def route_parallel(
         )
     )
 
-    async def call_one(idx: int, call: dict[str, str]) -> str:
+    async def call_one(idx: int, call: dict[str, str]) -> RoutedSpecialistOutput:
         specialist = call["specialist"]
         if debug_collector:
             debug_collector.emit("specialist_start", {
@@ -307,7 +376,7 @@ async def route_parallel(
                 "department_memory_chars": len(dept_memory_per_call[idx]),
             })
         t_start = time.monotonic()
-        result = await route_to_specialist(
+        out = await route_to_specialist_structured(
             specialist_name=specialist,
             query=call["query"],
             context=call.get("context", ""),
@@ -323,9 +392,9 @@ async def route_parallel(
             debug_collector.emit("specialist_done", {
                 "specialist": specialist,
                 "duration_ms": round((time.monotonic() - t_start) * 1000),
-                "response_preview": result[:120],
-                "response_length": len(result),
+                "response_preview": out.narrative[:120],
+                "response_length": len(out.narrative),
             })
-        return result
+        return out
 
     return list(await asyncio.gather(*(call_one(i, c) for i, c in enumerate(calls))))

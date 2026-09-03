@@ -1,8 +1,9 @@
 """The only production module that executes a deterministic calculation.
 
 It mints every authoritative identifier, calls the engine once, and returns an
-application-owned record. It holds no state, touches no narrative, and is not
-wired into any live path in this slice.
+application-owned record. It holds no state and touches no narrative. Its one
+production caller is ``FinanceAgent.analyze_structured`` (Phase 3B2), behind
+a default-off setting; a test pins that count.
 
 Rationale and review history: ``architecture/architecture-facts.yaml``.
 """
@@ -227,6 +228,24 @@ def _unavailable(
         computed_at=computed_at,
         errors=(CalculationError(code=_GATEWAY_ERROR_CODE, detail=detail),),
     )
+
+
+MAX_PROPOSALS_PER_CALL = MAX_REQUESTS_PER_BATCH
+"""The most proposals one specialist call may hand to :func:`execute_proposals`
+(the engine's batch limit). Exposed so the caller can gate on it as a declared
+condition rather than learn of it by exception; the caller imports this module
+only and never the calc package."""
+
+
+def is_usable_correlation_id(value: object) -> bool:
+    """Whether ``value`` may serve as a ``case_id`` / ``run_id`` for a request.
+
+    The same screen ``execute_proposals`` applies to those arguments, exposed so
+    the caller can fail closed *before* minting anything rather than learn by
+    exception. Kept here so the caller imports this module only — it never
+    needs the calc package for the rule.
+    """
+    return is_safe_identifier(value, max_length=MAX_ID_LEN)
 
 
 def execute_proposals(

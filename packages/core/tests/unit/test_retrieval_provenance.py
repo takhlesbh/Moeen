@@ -808,15 +808,18 @@ def test_route_to_specialist_forwards_the_set_to_cfo() -> None:
 def test_prebuilt_knowledge_map_supplies_no_retrieval_set() -> None:
     """Caller-supplied text carries no tokens, so it must authorise nothing."""
     from openexecutive.orchestrator import router as router_mod
+    from openexecutive.specialists.routed_output import RoutedSpecialistOutput
 
     captured: list[Any] = []
 
-    async def fake_route(**kwargs: Any) -> str:
+    # route_parallel dispatches through route_to_specialist_structured (Phase
+    # 3B2); the structured dispatcher is what receives the retrieval set.
+    async def fake_route(**kwargs: Any) -> RoutedSpecialistOutput:
         captured.append(kwargs.get("retrieval_set"))
-        return "r"
+        return RoutedSpecialistOutput(specialist="cfo", narrative="r")
 
-    orig = router_mod.route_to_specialist
-    router_mod.route_to_specialist = fake_route  # type: ignore[assignment]
+    orig = router_mod.route_to_specialist_structured
+    router_mod.route_to_specialist_structured = fake_route  # type: ignore[assignment]
     try:
         asyncio.run(
             router_mod.route_parallel(
@@ -825,7 +828,7 @@ def test_prebuilt_knowledge_map_supplies_no_retrieval_set() -> None:
             )
         )
     finally:
-        router_mod.route_to_specialist = orig  # type: ignore[assignment]
+        router_mod.route_to_specialist_structured = orig  # type: ignore[assignment]
     assert captured == [None]
 
 

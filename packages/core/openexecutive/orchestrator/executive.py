@@ -94,6 +94,7 @@ from openexecutive.orchestrator.workflow_run_tools import (
 )
 from openexecutive.prompts.cache_manager import build_system_blocks
 from openexecutive.providers import get_provider
+from openexecutive.specialists.routed_output import RoutedSpecialistOutput
 
 logger = logging.getLogger(__name__)
 
@@ -1108,12 +1109,20 @@ class Executive:
         consulted_out: list[str] | None = None,
         specialist_outputs_out: dict[str, str] | None = None,
         turn_id: str | None = None,
+        calc_outcomes_out: list[RoutedSpecialistOutput] | None = None,
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Tool-use loop that yields text deltas as they arrive.
 
         Yields _THINKING before each specialist call round so callers can send
         keepalive/progress events while the blocking specialist calls run.
         Also yields debug event dicts when a debug_collector is provided.
+
+        ``calc_outcomes_out``, when supplied, receives every specialist
+        envelope ``route_parallel`` returned, in dispatch order. It mirrors
+        ``specialist_outputs_out`` and is the only place an envelope leaves this
+        loop: the model's tool_result, ``specialist_outputs_out`` and the audit
+        row all receive ``narrative`` alone. No production caller supplies it
+        in this slice.
         """
         current_messages = list(messages)
         last_full_text = ""
@@ -1316,10 +1325,14 @@ class Executive:
                     debug_collector=debug_collector,
                 )
                 spec_ms = round((time.monotonic() - spec_t0) * 1000)
-                for tu, result in zip(
+                for tu, out in zip(
                     run_tool_uses, specialist_results, strict=True
                 ):
-                    results_by_id[tu["id"]] = result
+                    # The model sees prose only; engine records never enter
+                    # the prompt in this slice.
+                    results_by_id[tu["id"]] = out.narrative
+                if calc_outcomes_out is not None:
+                    calc_outcomes_out.extend(specialist_results)
                 # Over-budget specialist calls get an explicit skip result
                 # rather than being silently fanned out.
                 results_by_id.update(skipped_results)
@@ -1334,14 +1347,14 @@ class Executive:
                 if consulted_out is not None:
                     consulted_out.extend(c["specialist"] for c in run_calls)
                 if specialist_outputs_out is not None:
-                    for call, result in zip(
+                    for call, out in zip(
                         run_calls, specialist_results, strict=True
                     ):
                         # Last-write-wins if the same specialist is consulted
                         # in multiple iterations — committee only needs a
                         # representative excerpt per domain.
-                        specialist_outputs_out[call["specialist"]] = result
-                for call, spec_result in zip(
+                        specialist_outputs_out[call["specialist"]] = out.narrative
+                for call, spec_out in zip(
                     run_calls, specialist_results, strict=True
                 ):
                     audit_log(
@@ -1358,7 +1371,7 @@ class Executive:
                         full={
                             "query": call["query"],
                             "context": call.get("context", ""),
-                            "response": spec_result,
+                            "response": spec_out.narrative,
                             "active_prompt_blocks": _system_block_names(system_blocks),
                         },
                     )

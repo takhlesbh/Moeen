@@ -75,7 +75,7 @@ def test_route_parallel_auto_retrieves_per_specialist(
         )
     )
 
-    assert results == ["answer-from-cfo", "answer-from-chro"]
+    assert [r.narrative for r in results] == ["answer-from-cfo", "answer-from-chro"]
     assert sorted(seen_calls) == sorted([
         ("what is our burn?", "cfo"),
         ("should we layoff 10%?", "chro"),
@@ -133,4 +133,6 @@ def test_route_parallel_preserves_call_order(
             ]
         )
     )
-    assert results == ["answer-from-chro", "answer-from-cfo", "answer-from-chro"]
+    assert [r.narrative for r in results] == [
+        "answer-from-chro", "answer-from-cfo", "answer-from-chro"
+    ]

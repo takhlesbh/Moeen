@@ -38,11 +38,46 @@ module reached through a dependency are **not statically decidable here** and
 are outside this guard; they are controlled by review, not by this scan. The
 tests state that scope rather than let a green run imply more than it checked.
 
-**Filtering is relative to the scan root.** ``scan_tree`` compares
-``skip_parts`` against each file's path *below* ``root``, never against the
-absolute path. An earlier version compared against ``path.parts``, so a scan
-root that merely lived under a directory named ``tests`` (a CI checkout, a
-``tmp_path``) skipped every file and the boundary test passed vacuously.
+**Filtering is anchored, and almost nothing is skipped by rule.** ``scan_tree``
+skips two kinds of directory and nothing else:
+
+* at ANY depth, ``__pycache__`` — it holds no ``.py`` source, so there is
+  nothing to parse. That is the ONLY name-based rule. A draft also skipped
+  directories whose name is not an identifier (``.venv``, ``calc-helpers``) on
+  the premise that the importer cannot enter them; a probe showed the premise
+  is false — ``importlib.import_module("pkg.calc-helpers.door")`` imports
+  fine, and this module already models that literal-string form as a reach.
+  So such directories are scanned like any other;
+* by ANCHORED root-relative path only, the caller's ``skip_parts`` (``calc``,
+  ``tests``, ``.venv``): matched against the FIRST component below ``root``. An earlier
+  version matched every component, so a future
+  ``openexecutive/specialists/calc/helper.py`` importing the engine was
+  invisible to all three scanners; and the version before that matched the
+  absolute path, so a scan root that merely lived under a directory named
+  ``tests`` (a CI checkout, a ``tmp_path``) scanned zero files and the boundary
+  passed vacuously.
+
+**Symlinks are rejected, not followed.** The walk is ``os.walk`` with the
+default ``followlinks=False``, and any symlinked directory OR file met under
+the root raises :class:`SymlinkUnderScanRoot` naming it — checked before any
+skip rule, so no directory name can silence it. A scan that meets a symlink
+cannot make the one-door claim: the importer follows links and this walk does
+not, so a linked-in second importer would be unscanned. Rejecting rather than
+following is what keeps the walk bounded — it cannot leave the root, cannot
+cycle, and cannot read one real file twice — and it matches the calc-internal
+walk in ``test_calc_contract_foundation``. A repository that needs a symlink
+under a scanned root widens this deliberately, with the test failing until it
+does.
+
+**Reach forms this static guard does not see — stated, not detected.**
+Attribute traversal after a permitted import (``import openexecutive`` then
+``openexecutive.calc.execute_batch``), ``sys.modules["openexecutive.calc"]``,
+``getattr(pkg, "execute_batch")`` and ``globals()``/``vars()`` lookups all
+reach the engine without an import statement naming it, and none is decidable
+from an import table. They are controlled by review — the same status as the
+computed dynamic-import forms below — and no detector is added for them here:
+an attribute-traversal detector is a false-positive generator, and unreviewed
+logic on the evidence path is worse than an honest scope statement.
 
 The resolver is deliberately conservative. It over-reports rather than
 under-reports (``from A import B`` is recorded as exposing ``A.B`` whether or not
@@ -52,6 +87,7 @@ someone fixes, while a false negative is a silent second door.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 CALC_PACKAGE = "openexecutive.calc"
@@ -241,18 +277,65 @@ def reaches_execution(targets: set[tuple[str, bool]]) -> set[str]:
     return reaching
 
 
+class SymlinkUnderScanRoot(Exception):
+    """A symlink was met under a scanned root; the one-door claim is void."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"symlink under scan root: {path}")
+        self.path = path
+
+
+def _unimportable_dir(name: str) -> bool:
+    """A directory that can hold no ``.py`` source. Only ``__pycache__``.
+
+    Deliberately NOT ``not name.isidentifier()``: ``importlib.import_module``
+    does not validate identifiers, so a directory named ``calc-helpers`` is
+    importable through the literal dynamic form this module already treats as
+    a reach. Skipping it would hide a second door.
+    """
+    return name == "__pycache__"
+
+
+def _source_files(root: Path) -> list[Path]:
+    """Every real ``.py`` file under ``root``, refusing any symlink on the way.
+
+    The root itself is checked too: a scan pointed at a symlink would walk the
+    link target and report paths under a root that is not where the files are.
+    """
+    if root.is_symlink():
+        raise SymlinkUnderScanRoot(root)
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        for name in dirnames:
+            if (here / name).is_symlink():
+                raise SymlinkUnderScanRoot(here / name)
+        dirnames[:] = [name for name in dirnames if not _unimportable_dir(name)]
+        for name in filenames:
+            path = here / name
+            if path.is_symlink():
+                raise SymlinkUnderScanRoot(path)
+            if path.suffix == ".py":
+                files.append(path)
+    return sorted(files)
+
+
 def scan_tree(
     root: Path, *, package_name: str | None, skip_parts: tuple[str, ...] = ()
 ) -> dict[Path, set[tuple[str, bool]]]:
     """Resolve the import targets of every ``.py`` file under ``root``.
 
-    ``skip_parts`` is matched against the path *relative to* ``root`` only. A
-    directory named ``tests`` or ``calc`` above the root is not the scanned
-    tree's business and must not silence the scan.
+    ``skip_parts`` is matched against the FIRST path component *below* ``root``
+    only — ``("calc",)`` skips ``root/calc/…`` and nothing else, so a nested
+    ``root/specialists/calc/…`` is scanned. ``__pycache__`` is skipped at any
+    depth; nothing else is skipped by name. A symlink anywhere under ``root``
+    (or ``root`` itself) raises rather than being followed or ignored; see the
+    module docstring.
     """
     found: dict[Path, set[tuple[str, bool]]] = {}
-    for path in root.rglob("*.py"):
-        if any(part in skip_parts for part in path.relative_to(root).parts):
+    for path in _source_files(root):
+        relative = path.relative_to(root).parts
+        if len(relative) > 1 and relative[0] in skip_parts:
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))

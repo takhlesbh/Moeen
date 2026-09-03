@@ -5,6 +5,8 @@ Rationale and the review history behind each rule live in
 """
 from __future__ import annotations
 
+from typing import Any, get_args
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openexecutive.calc.contract import (
@@ -13,10 +15,12 @@ from openexecutive.calc.contract import (
     MAX_OPERANDS_PER_REQUEST,
     MAX_PURPOSE_LEN,
     Operand,
+    OperandBasis,
+    OperandRole,
     OperationId,
     RoundingMode,
 )
-from openexecutive.calc.numeric import MAX_SCALE
+from openexecutive.calc.numeric import MAX_SCALE, NumberFormat
 from openexecutive.calc.units import Unit
 
 
@@ -155,3 +159,104 @@ class CalculationProposal(BaseModel):
             f"and at most {max_length} characters, with no line or control "
             "characters. It is rejected rather than rewritten."
         )
+
+
+def _enum(literal: Any) -> list[str]:
+    """The tool-schema enum for a contract ``Literal``, derived, never retyped."""
+    return list(get_args(literal))
+
+
+CALCULATION_REQUESTS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "description": (
+        "Arithmetic you want computed deterministically. Each entry is a "
+        "PROPOSAL: name the operation, the typed operands with units, and the "
+        "claim it supports. You do not supply the answer, an id, a status or a "
+        "timestamp — the application computes and records those. Any figure "
+        "you also state in prose stays unverified."
+    ),
+    "items": {
+        "type": "object",
+        "properties": {
+            "claim_ref": {
+                "type": "string",
+                "description": (
+                    "claim_id in THIS result that the calculation supports. "
+                    "Must name a claim you emitted; anything else is dropped."
+                ),
+            },
+            "operands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "basis": {"type": "string", "enum": _enum(OperandBasis)},
+                        "label": {"type": "string"},
+                        "number_format": {
+                            "type": "string",
+                            "enum": _enum(NumberFormat),
+                        },
+                        "operand_id": {
+                            "type": "string",
+                            "description": "Unique within this proposal.",
+                        },
+                        "role": {
+                            "type": "string",
+                            "enum": _enum(OperandRole),
+                            "description": (
+                                "'stated_comparison' marks the applicant's own "
+                                "claimed figure for a 'variance' operation."
+                            ),
+                        },
+                        "source_hint": {
+                            "type": "object",
+                            "properties": {
+                                "document_label": {"type": "string"},
+                                "filename": {"type": "string"},
+                                "quoted_text": {"type": "string"},
+                                "retrieval_id_hint": {"type": "string"},
+                            },
+                        },
+                        "unit": {
+                            "type": "object",
+                            "properties": {
+                                "code": {
+                                    "type": "string",
+                                    "description": (
+                                        "A registry code (kg, t, ha, m2, "
+                                        "kg_per_m2, pct, pct_point, ...) or "
+                                        "currency:<ISO> such as currency:TND."
+                                    ),
+                                }
+                            },
+                            "required": ["code"],
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "The number as a string, never a float.",
+                        },
+                    },
+                    "required": ["operand_id", "label", "value", "unit", "basis"],
+                },
+            },
+            "operation": {"type": "string", "enum": _enum(OperationId)},
+            "purpose": {"type": "string"},
+            "rounding": {"type": "string", "enum": _enum(RoundingMode)},
+            "scale": {"type": "integer", "minimum": 0, "maximum": MAX_SCALE},
+            "target_unit": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+            },
+        },
+        "required": ["operation", "operands", "purpose"],
+    },
+}
+"""The wire shape of one ``calculation_requests`` entry, owned here beside the
+model it mirrors. Property names are declared in sorted order so the serialized
+tool block is byte-stable across processes (prompt caching keys on it).
+
+Note what is absent: no ``request_id``, ``correlation``, result, status,
+fingerprint, ``computed_at``, ``authority`` or evidence field. The model has no
+slot in which to assert any of them, and ``extra="forbid"`` on the model above
+rejects a payload that tries."""

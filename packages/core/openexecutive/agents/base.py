@@ -10,6 +10,13 @@ _SPECIALIST_TIMEOUT = 180.0
 
 
 class BaseAgent(ABC):
+    # Capability flag read by ``orchestrator.router``: an agent that sets this
+    # exposes ``analyze_structured`` and is dispatched through it by
+    # ``route_parallel``. Everyone else keeps the plain-string ``analyze``
+    # path, which the ~100 workflow call sites, the MCP tool and the Council
+    # sandbox use unchanged. Mirrors ``accepts_retrieval_set`` on FinanceAgent.
+    emits_structured_result: bool = False
+
     name: str
     domain: str
     model: str

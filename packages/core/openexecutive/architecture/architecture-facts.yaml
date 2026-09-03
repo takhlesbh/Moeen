@@ -266,6 +266,33 @@ providers:
 routing:
   pattern: Anthropic tool use with a single `consult_specialist` tool. Multiple parallel tool_use blocks per assistant turn fan out to specialists concurrently.
   parallel_function: openexecutive.orchestrator.router.route_parallel
+  parallel_return: |
+    route_parallel returns one specialists.routed_output.RoutedSpecialistOutput
+    per call, in call order (Phase 3B2). The envelope is the asyncio TASK
+    RESULT of each gathered child -- deliberately not a ContextVar, an agent
+    attribute or a registry: a ContextVar set inside a gathered child is
+    invisible to the awaiting parent (each task runs in a copied context) and
+    keeps whatever the parent held before, so a turn that computed nothing
+    would read as the previous turn. Only the return value reads correctly
+    and fails EMPTY rather than STALE; a test pins that a ContextVar set in the
+    child is None in the parent while the envelope is populated.
+
+    Dispatch is by capability flag, mirroring accepts_retrieval_set: an agent
+    declaring emits_structured_result (today: cfo only) is routed through
+    analyze_structured() and returns the envelope itself; every other agent --
+    and an unknown name -- goes through route_to_specialist() unchanged and
+    its string is wrapped, so those bytes come from the legacy path, not a
+    re-implementation. route_to_specialist() itself is untouched: -> str, same
+    signature, ~100 workflow/MCP/sandbox call sites unaffected.
+
+    The Executive reads envelope.narrative and NOTHING else: the model's
+    tool_result, the Committee's specialist_outputs (still dict[str, str]) and
+    the specialist_consult audit row all receive narrative alone. An optional
+    calc_outcomes_out list on _stream_agent_loop receives the envelopes; no
+    production caller supplies it in this slice. Failure semantics are
+    unchanged: gather without return_exceptions, no handler in call_one -- one
+    raising specialist (or a 180s SDK timeout) still fails the batch and the
+    turn, cancellation propagates, order is preserved.
   fanout_cap: |
     The number of parallel `consult_specialist` calls dispatched in a single
     turn is bounded by `MAX_PARALLEL_SPECIALISTS` (config). Default 0 is inert
@@ -3221,15 +3248,22 @@ clients:
 calc:
   module: openexecutive.calc
   status: |
-    CONTRACTS + ENGINE + AN UNWIRED GATEWAY. Phase 2 added the deterministic
-    engine (calc/engine.py) and engine-owned fingerprints. Phase 3B1 added two
-    modules under specialists/ and NOTHING ELSE:
+    CONTRACTS + ENGINE + A GATEWAY WITH EXACTLY ONE CALLER. Phase 2 added the
+    deterministic engine (calc/engine.py) and engine-owned fingerprints. Phase
+    3B1 added two modules under specialists/:
 
       specialists/calculation_proposal.py  CalculationProposal (model-shaped)
       specialists/calculation_gateway.py   execute_proposals + the record type
 
-    They are the ONLY production importers of openexecutive.calc, and the
-    gateway is the only module that can reach an execution or authority surface.
+    Phase 3B2 (see phase_3b2 below) gave the gateway its first and only
+    production caller, agents/finance.py, on the structured routing path and
+    behind a default-OFF setting (CALC_CFO_STRUCTURED_ENABLED). Two one-door
+    invariants, each with its own test:
+      A. only specialists/calculation_gateway.py imports calc.engine or
+         calc.authority (the execution surface);
+      B. only agents/finance.py calls execute_proposals -- resolved on the
+         AST, not by text -- and finance.py imports the gateway module ONLY:
+         it never names openexecutive.calc, the engine, or the authority.
     Two allowlists, with different scopes:
       * test_calc_contract_foundation scans openexecutive/, scripts/ AND evals/
         for any openexecutive.calc* import against a 2-entry allowlist. This is
@@ -3282,10 +3316,180 @@ calc:
     reach -- calculation_proposal.py does exactly that and must not read as an
     executor.
 
-    The gateway is DELIBERATELY UNWIRED: nothing constructs it. Putting
-    unconsumed work on the live CFO path would be cost and risk for no benefit,
-    and a test asserts no other module references either new file. The CFO,
-    Executive, Committee, UI and persistence are untouched; that is Phase 3B2.
+    Referrers of either calc-specialist module are pinned to exactly three:
+    agents/finance.py (the caller), specialists/result_contract.py (names the
+    PROPOSAL type: model-owned intent rides on the result) and
+    specialists/routed_output.py (names the record container: the envelope).
+    Executive, Committee, UI and persistence remain unchanged in behaviour.
+  phase_3b2: |
+    CFO-ONLY CONTROLLED TRIAL, DEFAULT OFF. What ships and what holds:
+
+    THE FLAG AT THE WIRE. emit_specialist_result_tool(*,
+    include_calculation_requests=False) and parse_specialist_result(...,
+    accept_calculation_requests=False). Both default to the pre-3B2 behaviour
+    BYTE FOR BYTE: the OFF schema's sha256 is pinned in tests under stated
+    serialisation definitions (json.dumps with separators=(",", ":"),
+    ensure_ascii=True, encoded UTF-8; insertion-order e09b4f8c..., canonical
+    sort_keys 3e35cc89...). ON inserts one property, `calculation_requests`,
+    at SORTED position 0 (dict order is what the provider serialises and the
+    cached tool block keys on); `required` is unchanged; the module template
+    is never mutated. ON is passed only by FinanceAgent.analyze_structured,
+    and only as the setting's value -- a test asserts no literal `=True`
+    exists anywhere in production. FinanceAgent.analyze (the ~100 legacy call
+    sites) hard-codes False, so with the flag OFF the key is UNKNOWN and a
+    model emitting it unprompted gets today's unknown-key degradation.
+
+    THE WIRE SCHEMA lives beside the model it mirrors
+    (calculation_proposal.CALCULATION_REQUESTS_SCHEMA), with enums DERIVED from
+    the contract Literals via get_args and a parity test that its properties
+    equal the model's fields exactly. It has no slot for request_id,
+    correlation, result, status, fingerprint, computed_at, authority,
+    evidence, verified_* or integrity.
+
+    PARSE INTEGRITY. parse_specialist_result has exactly three exits and the
+    boolean `degraded` cannot tell two of them apart, so SpecialistResult
+    gained `integrity: intact | partial | lost`, PARSER-AUTHORED like
+    degraded/degraded_reason:
+      lost    the _degraded() exit: claims=(), calculation_requests=(),
+              nothing about the model's structure survived (no payload, no
+              usable narrative, a claim that FAILED VALIDATION -- e.g. a
+              duplicate claim_id -- or a parser exception);
+      partial structure readable but something dropped (a non-object claim
+              entry, a stripped evidence ref, an unknown key, an unreadable
+              proposal); the claims PRESENT passed the full constructor and
+              only they are authoritative;
+      intact  the clean exit.
+    A validator makes the field agree with its shape (lost => degraded and
+    empty; partial => degraded; intact => not degraded); when absent it
+    derives from `degraded`. It is NOT in the tool schema and NOT an accepted
+    payload key: a payload writing "integrity" gets an unknown-key
+    degradation, and a test proves a payload cannot select `intact`.
+    Constructing or deserialising a result WITH integrity="intact" is legal
+    and proves nothing -- which is exactly why the gate below keys on the
+    in-process parse exit and the frame, never on this field alone.
+
+    Proposals are parsed ENTRY BY ENTRY (_scrub_calculation_requests): a
+    malformed one -- including one that smuggles request_id, fingerprint,
+    computed_at, authority, arithmetic_status or verified_result -- is dropped
+    and COUNTED ("N calculation request(s) could not be read"), its siblings
+    survive, and the result is `partial`. Measured: 7 valid + 2 forged =>
+    7 records.
+
+    THE GATES, in FinanceAgent._gated_calculations, in order, each failing
+    CLOSED with a literal diagnostic on the envelope (routed_output.py):
+      calc_disabled                the setting is off
+      calc_skipped_structure_lost  integrity == lost: no claim set to
+                                   authorize against
+      calc_no_proposals            nothing to execute
+      calc_too_many_proposals      more than the engine's batch limit (32,
+                                   re-exported by the gateway as
+                                   MAX_PROPOSALS_PER_CALL). A declared
+                                   condition with its own code, gated BEFORE
+                                   the frame is built -- security review found
+                                   it surfacing as calc_gateway_raised, i.e. a
+                                   model-controlled count disguised as an
+                                   engine crash.
+      calc_context_unavailable     audit context has no usable session/turn
+                                   id. NO constant fallback identity exists:
+                                   a request minted under "unbound_run" would
+                                   be an audit record that looks correlated
+                                   and is not. Workflow call sites are not
+                                   under a bound turn -- and they never reach
+                                   this method anyway (they call analyze).
+      calc_claim_set_unsafe        a final claim_id fails is_safe_identifier
+                                   (Claim.claim_id is only min_length=1). The
+                                   WHOLE set is refused, never filtered; the
+                                   gateway would raise on such a member and
+                                   model output must not be able to fail the
+                                   turn.
+      calc_gateway_raised          execute_proposals raised; contained. The
+                                   log line is a literal -- no exception text,
+                                   no model text.
+    known_claim_ids is frozenset(c.claim_id for c in result.claims) -- the
+    FINAL, constructor-validated set, never the raw payload, so a claim_ref
+    naming a claim the parser dropped is `unknown_claim_ref` at the gateway.
+    computed_at is a real UTC clock reading passed to the engine AS GIVEN.
+
+    METHOD FACTORING. _analyze_result is the ONE provider call and the parser
+    (never the gateway); _narrative_for is the legacy selection rule
+    (degraded => first text block, else narrative) shared by both public
+    methods; analyze() = _analyze_result(False) + _narrative_for -> str, with
+    the system_prompt_override branch unchanged; analyze_structured() =
+    _analyze_result(flag) + _narrative_for + _gated_calculations ->
+    RoutedSpecialistOutput, with no system_prompt_override parameter (the
+    router has none to pass; the Council sandbox uses analyze). AST tests pin
+    that execute_proposals is called from _gated_calculations only and
+    _gated_calculations from analyze_structured only; a runtime test drives
+    analyze() with proposals in the payload and the flag on, with the gateway
+    patched to raise, and gets today's degraded narrative. The provider mock
+    is awaited exactly once on both paths. test_cfo_structured_runtime.py
+    passes UNMODIFIED.
+
+    OWNERSHIP BY NESTING, STATED PRECISELY. RoutedSpecialistOutput nests
+    specialist_result (model-owned), calculations (gateway-owned), frame and
+    diagnostics (application-owned). Nesting preserves SEPARATION; it does not
+    AUTHENTICATE provenance. Like SpecialistCalculations, a deserialised
+    envelope proves nothing. In-process provenance comes from one source: the
+    explicit call path that built the object in this task from its own
+    gateway call.
+
+    GREENHARVEST FIXTURE (tests/unit/test_cfo_calc_fixture_integration.py),
+    driven through the REAL route_parallel with a stubbed provider -- offline,
+    deterministic, NOT a live-model trial. Exactly SEVEN operations, each
+    executed on the shipped engine before the fixture was written:
+      1 sum_components  15+22+8+6+10+4 pct                -> 65 pct
+      2 subtract        100 pct - 65 pct                  -> 35 pct
+      3 variance        35 pct vs stated 60 pct           -> -25.00; CONFLICT_DETECTED
+      4 subtract        42,000,000 - 30,140,000 TND       -> 11,860,000.00 TND
+      5 multiply        52 kg_per_m2 x 11 ha              -> 5,720,000 kg
+      6 variance        5,720,000 kg vs stated 572 t      -> 5,148.00 t; ORDER_OF_MAGNITUDE, ratio 10
+      7 variance        2,170 t vs stated 217 t           -> 1,953.00 t; ORDER_OF_MAGNITUDE, ratio 10
+    percentage_point_difference is NOT used for row 2: it outputs pct_point,
+    which the engine refuses to compare against the stated 60 pct (pct and
+    pct_point are different dimensions), so subtract is the operation whose
+    output the variance can consume. The narrative in the fixture CONTRADICTS
+    the engine (572 t, "above 60%") on purpose and is returned VERBATIM beside
+    the record; neither overwrites the other.
+
+    V1 LIMITATION, STATED HONESTLY: the seven operations verify arithmetic and
+    contradiction handling. Model-supplied operands are NOT independent
+    evidence -- every record reports EVIDENCE_UNAVAILABLE and
+    is_verified_evidence() is False. Proposals cannot reference each other, so
+    row 6's 5,720,000 kg input is a model-supplied literal that the fixture
+    cross-checks against row 5's engine result; the engine does not resolve
+    one proposal from another. 2,170 t is supplied, not derived, in this
+    trial. NO claim moves to verified evidence because of these calculations:
+    CalculationProvenance is UNCHANGED and still refuses any verified figure.
+
+    SCANNER HARDENING (the three LOWs deferred from 3B1, closed here because
+    the one-door evidence became load-bearing):
+      L1 skip_parts are anchored to the FIRST root-relative component; a
+         nested specialists/calc/helper.py importing the engine is now found.
+         Only __pycache__ is skipped by name (it holds no source). A draft
+         also skipped non-identifier names (.venv, calc-helpers) on the
+         premise the importer cannot enter them; security review showed the
+         premise FALSE -- importlib.import_module("pkg.calc-helpers.door")
+         works -- so such directories are scanned; .venv is skipped only when
+         a caller anchors it in skip_parts. A symlinked ROOT is refused too.
+      L2 symlinks are REJECTED, not followed: os.walk with the default
+         followlinks=False, and any symlinked directory or file under the
+         root raises SymlinkUnderScanRoot naming it, checked before any skip
+         rule. That is what keeps the walk bounded (cannot leave the root,
+         cannot cycle, cannot read one real file twice) and matches the
+         calc-internal walk. The real tree is asserted symlink-free.
+      L3 attribute traversal, sys.modules and getattr are NAMED in the
+         resolver's docstring as outside the static guard; no detector was
+         added (an attribute-traversal detector is a false-positive generator
+         on the evidence path).
+
+    OUT OF SCOPE, DELIBERATELY: no evidence resolver; no change to
+    CalculationProvenance, render_for_executive, committee.py,
+    committee_reviewers.py or route_to_specialist; no second specialist; no
+    persistence, API or UI surface; no calculation registry; no narrative
+    rewriting; no change to route_parallel's failure semantics; no live-model
+    trial. The next slice is a live-model trial behind the flag on a
+    non-production host, then an evidence resolver -- the only thing that can
+    move EVIDENCE_UNAVAILABLE.
   phase_3b1_scope: |
     THE READ-ONLY BOUNDARY IS THE DESIGN. Six earlier attempts at this slice
     were rejected in review, and every one of them edited

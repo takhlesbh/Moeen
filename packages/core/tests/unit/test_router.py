@@ -17,6 +17,7 @@ from openexecutive.orchestrator.router import (  # noqa: E402
     route_parallel,
     route_to_specialist,
 )
+from openexecutive.specialists.routed_output import RoutedSpecialistOutput
 
 
 def test_route_to_specialist_passes_episodic_to_analyze() -> None:
@@ -55,11 +56,16 @@ def test_route_parallel_distributes_episodic_to_each_specialist() -> None:
     Passing an empty retrieved_knowledge_map={} short-circuits the per-call
     auto-RAG (which would otherwise call into ChromaDB).
     """
+    # cfo declares emits_structured_result, so route_parallel dispatches it
+    # through analyze_structured and expects an envelope back; cso stays on
+    # the legacy analyze path and its string is wrapped by the router.
     cso_mock = AsyncMock(return_value="cso-out")
-    cfo_mock = AsyncMock(return_value="cfo-out")
+    cfo_mock = AsyncMock(
+        return_value=RoutedSpecialistOutput(specialist="cfo", narrative="cfo-out")
+    )
     with (
         patch.object(SPECIALIST_REGISTRY["cso"], "analyze", cso_mock),
-        patch.object(SPECIALIST_REGISTRY["cfo"], "analyze", cfo_mock),
+        patch.object(SPECIALIST_REGISTRY["cfo"], "analyze_structured", cfo_mock),
     ):
         results = asyncio.run(
             route_parallel(
@@ -71,7 +77,7 @@ def test_route_parallel_distributes_episodic_to_each_specialist() -> None:
                 episodic_context="SHARED_PAST_DECISIONS",
             )
         )
-    assert results == ["cso-out", "cfo-out"]
+    assert [r.narrative for r in results] == ["cso-out", "cfo-out"]
     assert cso_mock.await_args.kwargs["episodic_context"] == "SHARED_PAST_DECISIONS"
     assert cfo_mock.await_args.kwargs["episodic_context"] == "SHARED_PAST_DECISIONS"
 
@@ -81,10 +87,12 @@ def test_route_parallel_preserves_per_specialist_retrieved_knowledge() -> None:
     They must compose independently.
     """
     cso_mock = AsyncMock(return_value="x")
-    cfo_mock = AsyncMock(return_value="y")
+    cfo_mock = AsyncMock(
+        return_value=RoutedSpecialistOutput(specialist="cfo", narrative="y")
+    )
     with (
         patch.object(SPECIALIST_REGISTRY["cso"], "analyze", cso_mock),
-        patch.object(SPECIALIST_REGISTRY["cfo"], "analyze", cfo_mock),
+        patch.object(SPECIALIST_REGISTRY["cfo"], "analyze_structured", cfo_mock),
     ):
         asyncio.run(
             route_parallel(
