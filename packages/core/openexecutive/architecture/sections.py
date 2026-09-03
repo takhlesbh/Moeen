@@ -271,8 +271,8 @@ SECTIONS: list[SectionSpec] = [
     # yet. New top-level module; see `calc:` in architecture-facts.yaml.
     SectionSpec(
         id="calc",
-        title="Deterministic Calculation Contracts",
-        sub="Typed calculation request/result contracts, a closed unit registry with exact factors, and the authority boundary that keeps a model from calling its own arithmetic verified. Contracts only — no engine yet.",
+        title="Deterministic Calculation Engine",
+        sub="Typed contracts, deterministic execution, one gateway, and CFO integration.",
         kb_query="deterministic calculation contract units decimal authority fingerprint verification evidence",
         wants_mermaid=True,
         diagram_kind="flowchart",
