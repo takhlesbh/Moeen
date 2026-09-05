@@ -277,6 +277,18 @@ SECTIONS: list[SectionSpec] = [
         wants_mermaid=True,
         diagram_kind="flowchart",
     ),
+    # `evidence` -- the Evidence & Analysis foundation. Phase 4A2b wires schema
+    # initialization and client isolation; ingestion, extraction and retrieval
+    # remain deliberately unwired. New top-level module; see `evidence:` in
+    # architecture-facts.yaml.
+    SectionSpec(
+        id="evidence",
+        title="Evidence Registry & Provenance",
+        sub="Stable scope identity, the durable document registry, and the trust boundary that keeps identity out of the model's hands.",
+        kb_query="evidence registry scope logical source document version provenance identity ownership foreign key chunk offsets",
+        wants_mermaid=True,
+        diagram_kind="flowchart",
+    ),
 ]
 
 

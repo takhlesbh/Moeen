@@ -82,6 +82,12 @@ ENGAGEMENT_STATUSES = ("active", "paused", "winding_down", "completed")
 # Ordered children-before-parents for PRAGMA foreign_keys=ON. Existence-guarded
 # at delete time, so stores that haven't initialized on this box are skipped.
 _BLANK_WIPE_TABLES = (
+    # Evidence registry, children before parents. Omitting these would leave the
+    # PREVIOUS client's scopes and documents live in a blank slot -- the reused
+    # slug would then resolve to their scope instead of minting a new one.
+    "evidence_document_versions",
+    "evidence_logical_sources",
+    "evidence_scopes",
     "chat_messages",
     "sessions",
     "decisions",
@@ -524,6 +530,7 @@ def _ensure_schemas() -> None:
     from openexecutive.agents.overrides import initialize_overrides_db
     from openexecutive.alerts.store import initialize_db as init_alerts
     from openexecutive.departments.store import initialize_db as init_departments
+    from openexecutive.evidence.registry import initialize_evidence_registry
     from openexecutive.fixtures.store import initialize_db as init_fixtures
     from openexecutive.knowledge.review_store import ReviewStore
     from openexecutive.memory.episodic import initialize_db as init_episodic
@@ -545,6 +552,9 @@ def _ensure_schemas() -> None:
     init_departments(db_path)
     init_monitoring(db_path)
     ReviewStore.initialize_db(db_path)
+    # A slot saved before the registry shipped has none of its tables; without
+    # this, restoring it leaves the schema missing until the next process boot.
+    initialize_evidence_registry(db_path)
 
 
 def _reseed_blank_defaults(*, seed_departments: bool = True) -> None:
