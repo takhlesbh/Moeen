@@ -17,6 +17,7 @@ that the offsets were checked against real text.
 """
 from __future__ import annotations
 
+import re
 import unicodedata
 
 from openexecutive.evidence import identity
@@ -35,6 +36,10 @@ MAX_TEXT_CODE_POINTS = 2_000_000
 MAX_SCOPE_ID = 128
 MAX_LOGICAL_SOURCE_KEY = 200
 MAX_EXTRACTOR_FIELD = 128
+
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+"""Stored-hash shape. Only ``rehydrate_document_version`` needs it: a minted hash
+comes from :func:`identity.content_sha256` and is well-formed by construction."""
 
 
 class EvidenceFactoryError(ValueError):
@@ -78,24 +83,22 @@ def _bounded_text(value: str, label: str) -> str:
     return value
 
 
-def mint_document_version(
+def _derive_document_version(
     *,
-    raw_bytes: bytes,
     scope_id: str,
     logical_source_key: str,
+    content_sha256: str,
+    byte_size: int,
 ) -> DocumentVersion:
-    """Mint the canonical version record for one document's raw bytes.
+    """The single derivation site for a ``DocumentVersion``. Nothing else mints one.
 
-    ``logical_source_key`` is **trusted** input from the application or human
-    workflow boundary — a registry entry supplied by the caller, never inferred
-    from filename, model output, URL similarity or content hash, and never
-    present on the proposal. It groups versions of one logical document; it does
-    not prove lineage or independence.
+    :func:`mint_document_version` arrives here with a hash it computed from the
+    bytes; :func:`rehydrate_document_version` arrives with one read back from
+    storage. Both must yield an identical record for identical identity inputs,
+    and that is only guaranteed while there is exactly **one** copy of the
+    derivation — so the two entry points differ solely in how they obtain
+    ``content_sha256`` and ``byte_size``, never in how identity is computed.
     """
-    if not isinstance(raw_bytes, bytes):
-        raise EvidenceFactoryError("raw_bytes must be bytes")
-    if len(raw_bytes) > MAX_RAW_BYTES:
-        raise EvidenceFactoryError(f"raw_bytes exceeds {MAX_RAW_BYTES} bytes")
     scope_id = _bounded_identifier(scope_id, "scope_id", MAX_SCOPE_ID)
     logical_source_key = _bounded_identifier(
         logical_source_key, "logical_source_key", MAX_LOGICAL_SOURCE_KEY
@@ -104,18 +107,82 @@ def mint_document_version(
     logical_source_id = identity.mint_id(
         identity.TAG_LOGICAL_SOURCE, scope_id, logical_source_key
     )
-    content_hash = identity.content_sha256(raw_bytes)
     version_id = identity.mint_id(
-        identity.TAG_DOCUMENT_VERSION, scope_id, logical_source_id, content_hash
+        identity.TAG_DOCUMENT_VERSION, scope_id, logical_source_id, content_sha256
     )
     with trusted_construction():
         return DocumentVersion(
             document_version_id=version_id,
             scope_id=scope_id,
             logical_source_id=logical_source_id,
-            content_sha256=content_hash,
-            byte_size=len(raw_bytes),
+            content_sha256=content_sha256,
+            byte_size=byte_size,
         )
+
+
+def mint_document_version(
+    *,
+    raw_bytes: bytes,
+    scope_id: str,
+    logical_source_key: str,
+) -> DocumentVersion:
+    """Mint the canonical version record for one document's raw bytes.
+
+    ``logical_source_key`` is **trusted** input supplied by the caller, never
+    inferred from filename, model output, URL similarity or content hash, and
+    never present on the proposal. It groups versions of one logical document; it
+    does not prove lineage or independence. Its production authority is
+    :mod:`openexecutive.evidence.registry`, which mints an opaque value per
+    logical source; this function does not care where it came from, only that the
+    caller is trusted to supply it.
+    """
+    if not isinstance(raw_bytes, bytes):
+        raise EvidenceFactoryError("raw_bytes must be bytes")
+    if len(raw_bytes) > MAX_RAW_BYTES:
+        raise EvidenceFactoryError(f"raw_bytes exceeds {MAX_RAW_BYTES} bytes")
+    return _derive_document_version(
+        scope_id=scope_id,
+        logical_source_key=logical_source_key,
+        content_sha256=identity.content_sha256(raw_bytes),
+        byte_size=len(raw_bytes),
+    )
+
+
+def rehydrate_document_version(
+    *,
+    scope_id: str,
+    logical_source_key: str,
+    content_sha256: str,
+    byte_size: int,
+) -> DocumentVersion:
+    """Rebuild a canonical record from stored fields, without the original bytes.
+
+    A persistence layer that reads a row back cannot call
+    :func:`mint_document_version` — the bytes are gone — and must not construct a
+    canonical record itself, which would bypass ``trusted_construction``. This is
+    the sanctioned path, and it is sound without the bytes because every id is a
+    function of ``(scope_id, logical_source_key, content_sha256)`` alone.
+
+    It **re-derives** rather than trusting: a caller compares the returned
+    ``document_version_id`` against the stored primary key, so a tampered or
+    corrupted row surfaces as a mismatch instead of a silent wrong answer.
+    ``content_sha256`` is checked for shape only — nothing here can verify it
+    against bytes it was not given, and pretending otherwise would be a lie.
+    """
+    if not isinstance(content_sha256, str):
+        raise EvidenceFactoryError("content_sha256 must be str")
+    if not _HEX64_RE.match(content_sha256):
+        raise EvidenceFactoryError("content_sha256 must be 64 lowercase hex characters")
+    if isinstance(byte_size, bool) or not isinstance(byte_size, int):
+        raise EvidenceFactoryError("byte_size must be int")
+    if not 0 <= byte_size <= MAX_RAW_BYTES:
+        raise EvidenceFactoryError(f"byte_size must be 0..{MAX_RAW_BYTES}")
+    return _derive_document_version(
+        scope_id=scope_id,
+        logical_source_key=logical_source_key,
+        content_sha256=content_sha256,
+        byte_size=byte_size,
+    )
 
 
 def mint_extraction(

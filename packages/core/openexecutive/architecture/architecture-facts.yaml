@@ -4187,6 +4187,121 @@ calc:
       refused) and keeps this module from being the authority on which
       currencies exist.
 
+evidence: |
+  The Evidence & Analysis foundation. Authoritative chain:
+  Claim -> Evidence -> Source -> Provenance -> Current Status.
+
+  THE REGISTRY IS AUTHORITATIVE. Chroma is a replaceable retrieval index and is
+  NOT the document registry. A rebuilt collection loses nothing a registry row
+  asserts; a lost registry row cannot be rebuilt from Chroma. Chunk metadata
+  (`document_id`, chunk id) stays DESCRIPTIVE and never authorises provenance.
+
+  WHAT PHASE 4A2b WIRES -- schema initialization and client isolation ONLY:
+    - `initialize_evidence_registry(db_path)` in the API lifespan, called bare
+      like every initializer beside it, so a failure aborts startup;
+    - the same call in `clients.slots._ensure_schemas`, so a slot saved before
+      this shipped gains the tables on restore;
+    - the three tables in `clients.slots._BLANK_WIPE_TABLES`, children before
+      parents, so a blank slot cannot retain the previous client's rows.
+
+  NOT WIRED, DELIBERATELY: document ingestion, extraction, chunking, Chroma and
+  retrieval are untouched. No production caller writes a registry row yet.
+  `POST /documents` and `knowledge/loader.py` still key documents by
+  `company_doc::<safe_filename>` (see `knowledge.document_identity`).
+
+  IDENTITY AUTHORITY:
+    - scope_id           -- registry, opaque uuid4().hex
+    - logical_source_key -- registry, opaque uuid4().hex, NOT on the record type
+    - logical_source_id  -- factory, mint_id(TAG_LOGICAL_SOURCE, scope_id, key)
+    - document_version_id-- factory, mint_id(TAG_DOCUMENT_VERSION, scope_id,
+                            logical_source_id, content_sha256)
+    - content_sha256 / byte_size -- evidence.identity over the raw bytes
+    - display_name / display_label -- caller, mutable, never hashed
+    - binding_kind / binding_key   -- caller, closed domain; lookup and
+                                      uniqueness authority, never hashed
+
+  THE MODEL MINTS NONE OF IT. Untrusted input parses only into
+  DocumentIngestProposal, which has no id/hash/scope/timestamp field and
+  rejects one outright. A filename, path, display label or model output can
+  never become logical identity. An architecture test forbids `agents`,
+  `specialists`, `orchestrator`, `prompts` and `personas` from importing
+  `evidence.registry`, and the registry never enters `trusted_construction` --
+  it persists canonical records through `factory.rehydrate_document_version`.
+
+  SCOPE. The isolation boundary owning a set of logical sources; binding maps
+  onto the existing CompanyContext. The domain is CLOSED to client_slot,
+  fixture and single_company, enforced three times: a StrEnum, a per-kind key
+  validator, and a SQL CHECK. SQLite cannot ALTER a CHECK, so a future binding
+  (e.g. analysis_workspace) needs a deliberate table rebuild AND an API change
+  -- it can never become valid because the column accepts arbitrary text.
+
+  RENAME AND REUSE. No id derives from binding_key, so a renamed client slot
+  would keep its scope_id and every document keeps its identity; only the
+  binding would move (`rebind_scope` is NOT shipped -- no caller exists).
+  Retiring a scope releases its binding, because the uniqueness index covers
+  live rows only, so a REUSED client slug mints a NEW scope rather than
+  inheriting the old client's documents. That holds only because the registry
+  tables are in _BLANK_WIPE_TABLES.
+
+  OWNERSHIP INVARIANT. Two independent foreign keys prove both parents exist
+  but NOT that the logical source belongs to that scope -- a raw insert pairing
+  scope A with scope B's logical source satisfies both, and was empirically
+  accepted before this was closed. evidence_document_versions therefore carries
+  a COMPOSITE foreign key (logical_source_id, scope_id) against the unique
+  parent index idx_evidence_ls_id_scope. That index is REQUIRED, not an
+  optimisation: without it SQLite refuses EVERY insert with "foreign key
+  mismatch". The individual scope_id FK is KEPT -- it stops an already-orphaned
+  logical source propagating a ghost scope -- and the individual
+  logical_source_id FK is OMITTED as strictly implied by the composite.
+
+  PRAGMA foreign_keys IS A SILENT NO-OP INSIDE AN OPEN TRANSACTION, and the
+  driver's default mode opens one on the first DML. Every registry connection
+  is therefore opened with isolation_level=None and READS THE PRAGMA BACK,
+  failing closed with `storage_unavailable` if it is not 1. Without that, the
+  ownership constraint could be silently disabled with no error.
+
+  SEMANTICS:
+    - registering identical bytes under the same source is idempotent BY
+      CONSTRUCTION -- the PK is a pure function of (scope_id, key, bytes);
+    - creating a logical source is NEVER idempotent: two calls with the same
+      label are two sources, because sameness is a human judgement. There is NO
+      idempotency token -- one whose reuse could attach a document to the wrong
+      source was rejected. Operation-level retry safety waits for the upload
+      transaction in 4A2c/4A2d;
+    - nothing is hard-deleted; retired_at is ONE-WAY, enforced by trigger;
+    - every immutable column is pinned by a BEFORE UPDATE trigger, so
+      immutability is a database fact, not a code convention;
+    - version listing orders by (registered_at DESC, document_version_id DESC)
+      -- durable stored fields only, NEVER rowid, which VACUUM does not preserve
+      and which is exactly how a slot is saved (VACUUM INTO). The id is a
+      tie-breaker only and expresses NO version precedence. Which version is
+      "current" is deliberately UNDEFINED until ingestion exists.
+
+  UPLOAD OBSERVATIONS ARE DEFERRED to 4A2c. Filename, media type, uploader,
+  upload time and origin are absent from evidence_document_versions: two
+  uploads of identical bytes may differ in all of them, and storing one set on
+  an immutable content row would make the first upload look canonical while
+  discarding the rest. They belong to an append-only observation keyed by
+  document_version_id.
+
+  OFFSET-PRESERVING EXTRACTION (4A2a). `chunk_with_offsets` guarantees
+  nfc_text[c.start_char:c.end_char] == c.text exactly -- the precondition
+  factory.mint_source_span checks before minting a span. Legacy
+  knowledge.loader.chunk_text splits/rejoins on whitespace and DESTROYS
+  character offsets; it is still what ingestion uses. Production constants
+  PRODUCTION_MAX_CODE_POINTS=2000 and PRODUCTION_OVERLAP_CODE_POINTS=200 are
+  defined but NOT WIRED to any call site. Their safety bound must include the
+  boundary lookback:
+      P_min   = max - BOUNDARY_LOOKBACK - overlap
+      C_worst = ceil((MAX_TEXT_CODE_POINTS - max) / P_min) + 1
+  At 2000/200: P_min=1600, C_worst=1250, inside MAX_CHUNK_COUNT=2000. A bound
+  omitting the lookback would wrongly admit 1200/150 (true worst case 2353).
+
+  DEFERRED: upload observations and durable extraction artifacts (4A2c);
+  ingestion wiring, atomic upload and Chroma stage-and-swap plus legacy
+  company_doc:: mapping (4A2d); EvidenceItem resolver (4A3); Source Lineage
+  (4A4); Claim Ledger (4A5); trusted numeric extraction (4A6).
+
 diagram_style:
   required_classdefs: [entry, compute, storage, cache, external, hot]
   rules:

@@ -63,6 +63,7 @@ def test_sections_have_unique_stable_ids() -> None:
         # only; no arithmetic engine and no production caller yet. New
         # top-level module.
         "calc",
+        "evidence",
     ]
 
 

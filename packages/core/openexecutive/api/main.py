@@ -177,6 +177,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     initialize_db()
     initialize_alerts_db()
 
+    # Evidence registry (Phase 4A2b): scopes, logical sources, document versions.
+    # Schema only -- nothing on the ingestion, extraction or Chroma paths writes a
+    # registry row yet. Bare call, like every initializer above it: a failure here
+    # must abort startup rather than leave the app serving without the ownership
+    # constraints that keep one client's documents out of another's scope.
+    from openexecutive.evidence.registry import initialize_evidence_registry
+    from openexecutive.memory.episodic import DB_PATH as _EPISODIC_DB_PATH
+    initialize_evidence_registry(_EPISODIC_DB_PATH)
+
     # User-generated company fixtures (DB-backed; persists on the Fly volume).
     from openexecutive.fixtures.store import initialize_db as initialize_fixtures_db
     initialize_fixtures_db()

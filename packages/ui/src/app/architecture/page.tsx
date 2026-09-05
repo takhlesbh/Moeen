@@ -36,6 +36,7 @@ const SECTIONS = [
   { id: 'staff_onboarding', label: 'Staff Onboarding', sub: 'Role-tailored onboarding for new hires: reusable templates, per-hire plans with phased task checklists, the role_onboarding brief workflow, a bounded ramp drip, and chat + /today integration.' },
   { id: 'clients', label: 'Client Companies (Slots)', sub: 'Multi-client mode for fractional executives: named save files of the full company context, one active at a time, with save-back switching and per-client MCP tool configs.' },
   { id: 'calc', label: 'Deterministic Calculation Engine', sub: 'Typed contracts, deterministic execution, one gateway, and CFO integration.' },
+  { id: 'evidence', label: 'Evidence Registry & Provenance', sub: 'Scope identity, the durable document registry, and the trust boundary. The SQLite registry is authoritative; Chroma is a replaceable index.' },
 ];
 
 interface SectionMeta {

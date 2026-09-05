@@ -64,6 +64,36 @@ BOUNDARY_LOOKBACK = 200
 per chunk is O(1) and the whole pass stays O(n) — never a scan back to
 ``start``, and never a substring search."""
 
+PRODUCTION_MAX_CODE_POINTS = 2_000
+"""The chunk size production ingestion will use. Not wired to a call site yet.
+
+Chosen against the *corrected* worst-case bound, which must include
+:data:`BOUNDARY_LOOKBACK`: the boundary search can pull ``end`` back by up to
+``BOUNDARY_LOOKBACK`` code points, so the guaranteed progress per chunk is
+
+    P_min = max_code_points - BOUNDARY_LOOKBACK - overlap_code_points
+
+and the chunk count at the input ceiling is
+
+    C_worst = ceil((MAX_TEXT_CODE_POINTS - max) / P_min) + 1
+
+At 2000/200 that is ``P_min = 1600`` and ``C_worst = 1250``, comfortably inside
+:data:`MAX_CHUNK_COUNT` (2,000). An invariant that omitted the lookback term
+would wrongly admit 1200/150, whose true worst case is 2,353 — over the cap.
+
+2,000 also stays at or below :data:`MAX_CHUNK_CODE_POINTS`, so a whole chunk can
+always be proposed as a single quote.
+"""
+
+PRODUCTION_OVERLAP_CODE_POINTS = 200
+"""Production overlap: 10% of :data:`PRODUCTION_MAX_CODE_POINTS`.
+
+Changing either constant without re-checking ``C_worst`` can push chunking over
+:data:`MAX_CHUNK_COUNT` at the input ceiling, turning a maximum-size document
+into a hard ``too_many_chunks`` failure. ``test_evidence_chunk_policy`` pins the
+whole inequality, so an unsafe pair fails the suite rather than production.
+"""
+
 
 class ChunkingError(ValueError):
     """A chunking argument was rejected.
